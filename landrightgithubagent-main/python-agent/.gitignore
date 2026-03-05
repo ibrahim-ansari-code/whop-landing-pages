@@ -1,0 +1,10 @@
+.env
+.agent-state.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/

@@ -1,0 +1,36 @@
+{
+  "name": "landright-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "vitest run",
+    "test:pipeline": "vitest run --run scripts/test-generation-pipeline.test.ts",
+    "test:pipeline:full": "vitest run --run scripts/test-full-claude-pipeline.test.ts",
+    "test:vercel-pipeline": "vitest run --run scripts/vercel-build-pipeline.test.ts",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "esbuild": "^0.27.3",
+    "next": "16.1.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/archiver": "^7.0.0",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5.1.4",
+    "eslint": "^9",
+    "eslint-config-next": "16.1.6",
+    "tailwindcss": "^4",
+    "typescript": "^5",
+    "vitest": "^4.0.18"
+  }
+}

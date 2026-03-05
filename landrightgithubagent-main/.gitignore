@@ -1,0 +1,9 @@
+.env
+*.pem
+.agent-state.json
+node_modules/
+dist/
+generator-output/
+data/
+*.log
+.DS_Store

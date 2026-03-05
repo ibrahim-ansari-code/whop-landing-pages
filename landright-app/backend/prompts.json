@@ -1,0 +1,7 @@
+[
+  {
+    "id": "default",
+    "label": "Default",
+    "system_prompt": "Generate a landing page. Follow the design skill above."
+  }
+]

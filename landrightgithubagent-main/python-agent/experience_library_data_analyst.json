@@ -1,0 +1,10 @@
+[
+  "**Choice Paralysis Threshold**: The 7\u21924 CTA reduction pattern suggests choice paralysis kicks in around 6-7 CTAs. Monitor for performance degradation beyond this threshold across different page types, with diminishing returns typically starting at 4-5 primary actions.",
+  "**2-2 Distribution Pattern**: Hero-to-footer CTA ratios of 2:2 often outperform uneven distributions (like 4:3). Test balanced splits before trying asymmetric layouts.",
+  "**Benchmark Against Winners**: Always identify your best-performing variant's CTA structure before making adjustments. Use successful patterns as templates rather than starting from scratch.",
+  "**Cognitive Load Reduction**: When reward scores plateau or decline, prioritize removing redundant CTAs over adding new ones. Simplification often beats optimization.",
+  "**Consistent Messaging Consolidation**: High-performing CTA reductions typically involve merging similar actions rather than random removal. Group related CTAs and eliminate true duplicates first.",
+  "**Run Adjustments for Clutter**: If analysis shows >6 total CTAs with scattered placement, default to RUN_ADJUST rather than SKIP_ALIGNMENT. Clutter reduction has high success probability.",
+  "**Convergence Validation**: When multiple analytical approaches yield identical high rewards (0.95+) and similar solutions, you've likely discovered a fundamental UX principle that transcends specific implementation details and is worth codifying across other variants.",
+  "**4-CTA Sweet Spot**: The 4-total-CTA configuration with 2:2 distribution appears to be a local optimum for conversion-focused pages. Test this as a baseline before exploring other counts."
+]
