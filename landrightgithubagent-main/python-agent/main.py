@@ -30,6 +30,7 @@ from config import (
     DESIGN_SKILL_PATH_RESOLVED,
     EXPERIENCE_LIBRARY_CTA_PATH_RESOLVED,
     EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED,
+    EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED,
     GITHUB_REPO_FULL_NAME,
     GITHUB_TOKEN,
     REPO_ALLOW_LIST,
@@ -409,6 +410,20 @@ MAX_CTA_ADJUST_OPS = 5
 MAX_CTA_ADJUST_CHANGED_LINES = 120
 
 
+def _alignment_output_token_budget() -> int:
+    model = (ANTHROPIC_MODEL or "").lower()
+    if "haiku" in model:
+        return 3500
+    return 7000
+
+
+def _section_rewrite_output_token_budget() -> int:
+    model = (ANTHROPIC_MODEL or "").lower()
+    if "haiku" in model:
+        return 3000
+    return 5000
+
+
 def _normalize_section_key(section: str | None) -> str:
     raw = re.sub(r"[^a-z0-9]+", "-", (section or "").strip().lower()).strip("-")
     if raw in {"hero-top", "top", "hero"}:
@@ -483,8 +498,6 @@ def _validate_alignment_candidate(original_tsx: str, candidate_tsx: str) -> tupl
     candidate = (candidate_tsx or "").strip()
     if not candidate:
         return False, "empty output"
-    if candidate == original:
-        return False, "no change"
     original_lower = original.lower()
     candidate_lower = candidate.lower()
     if '"use client"' in original_lower and '"use client"' not in candidate_lower and "'use client'" not in candidate_lower:
@@ -503,6 +516,119 @@ def _validate_alignment_candidate(original_tsx: str, candidate_tsx: str) -> tupl
     return True, "ok"
 
 
+def _validate_section_block_tsx(section_block: str) -> tuple[bool, str]:
+    wrapped = (
+        '"use client";\n\n'
+        "export default function SectionPreview() {\n"
+        "  return (\n"
+        "    <main>\n"
+        f"{section_block}\n"
+        "    </main>\n"
+        "  );\n"
+        "}\n"
+    )
+    return _validate_variant_tsx_runnable(wrapped)
+
+
+def _repair_section_block_tsx(
+    *,
+    section_id: str,
+    original_block: str,
+    broken_block: str,
+    validation_reason: str,
+    temperature: float = 0.0,
+) -> str:
+    if not ANTHROPIC_API_KEY:
+        return ""
+    import anthropic
+    client = anthropic.Anthropic(
+        timeout=float(CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS),
+        max_retries=2,
+    )
+    system = (
+        (FRONTEND_DESIGN_SKILL or "")
+        + "\n\nYou are repairing one JSX section block inside a Next.js page. "
+        + "Return only the corrected section block. Preserve the same data-landright-section id, design direction, and CTA intent. "
+        + "Do not add imports, helper functions, or explanation."
+    )
+    user = (
+        f"Section id: {section_id}\n"
+        f"Validation error:\n{validation_reason}\n\n"
+        f"Original section block:\n{original_block}\n\n"
+        f"Broken rewritten section block:\n{broken_block}\n\n"
+        "Return only the corrected section block."
+    )
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=min(2000, _section_rewrite_output_token_budget()),
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            temperature=temperature,
+        )
+    except Exception as e:
+        log.warning("CTA section repair failed: %s", e)
+        return ""
+    text = "".join(getattr(b, "text", "") for b in msg.content)
+    return _strip_tsx_fences(text.strip())
+
+
+def _generate_aligned_variant_with_retries(
+    *,
+    repo_full_name: str,
+    layer: str,
+    variant_id: str,
+    current_tsx: str,
+    best_id: str,
+    cta_description: str,
+    experience_library: list[str],
+    best_cta_count: int | None,
+    best_clicks: int | None,
+    best_time_sec: float | None,
+    underperforming_clicks: int | None,
+    underperforming_time_sec: float | None,
+    best_section_times: dict[str, float] | None,
+    underperforming_section_times: dict[str, float] | None,
+) -> str:
+    temperatures = (0.0, 0.15, 0.3)
+    last_reason = "Claude returned no content"
+    for attempt_idx, temperature in enumerate(temperatures, start=1):
+        new_tsx = _call_claude_align_cta(
+            FRONTEND_DESIGN_SKILL,
+            cta_description,
+            current_tsx,
+            best_id,
+            experience_library=experience_library,
+            underperforming_variant_id=variant_id,
+            best_cta_count=best_cta_count,
+            best_clicks=best_clicks,
+            best_time_sec=best_time_sec,
+            underperforming_clicks=underperforming_clicks,
+            underperforming_time_sec=underperforming_time_sec,
+            best_section_times=best_section_times,
+            underperforming_section_times=underperforming_section_times,
+            temperature=temperature,
+        )
+        log.info("Claude align attempt %s completed for %s (%s)", attempt_idx, variant_id, repo_full_name)
+        if not new_tsx:
+            last_reason = "Claude returned no content"
+            continue
+        is_runnable, validation_reason = _validate_variant_tsx_runnable(new_tsx)
+        if is_runnable:
+            return new_tsx
+        last_reason = f"generated TSX is not runnable ({validation_reason})"
+        log.warning(
+            "Retrying %s for %s layer %s after unrunnable output on attempt %s: %s",
+            variant_id,
+            repo_full_name,
+            layer,
+            attempt_idx,
+            validation_reason,
+        )
+    log.warning("Skipping push for %s after retries: %s", variant_id, last_reason)
+    return ""
+
+
 def _call_claude_align_cta_section_rewrite(
     design_skill: str,
     best_cta_description: str,
@@ -518,6 +644,7 @@ def _call_claude_align_cta_section_rewrite(
     underperforming_section_times: dict[str, float] | None = None,
     experience_library: list[str] | None = None,
     temperature: float = 0.0,
+    retry_instruction: str = "",
 ) -> str:
     editable_sections = _select_alignment_sections(underperforming_tsx, underperforming_section_times, limit=3)
     if not editable_sections:
@@ -549,6 +676,7 @@ def _call_claude_align_cta_section_rewrite(
         + "Only include tracked sections you are changing. "
         + "Within those sections you have full control over CTA structure, CTA prominence, CTA labels, CTA-local wrappers, and CTA placement. "
         + "Keep the variant's design language and overall identity intact, and make it more similar to the winner's CTA strategy without copying it exactly. "
+        + "You must make at least one meaningful CTA-local change in every returned section so the result is committable. "
         + "Do not introduce new React state, helper functions, modal toggles, undefined handlers, or fake embed behavior. "
         + "Preserve any existing embed/widget/script markup if it appears inside a returned section. "
         + "Do not rename or remove data-landright-section values. "
@@ -562,7 +690,8 @@ def _call_claude_align_cta_section_rewrite(
         + f"Tracked sections in the full file that must still exist: {', '.join(tracked_sections) if tracked_sections else 'none'}.\n"
         + f"Highest-engagement sections in the best variant: {_summarize_section_engagement(best_section_times or {})}.\n"
         + f"Highest-engagement sections in the underperforming variant: {_summarize_section_engagement(underperforming_section_times or {})}.\n"
-        + "Rewrite only the tracked sections below. Keep each returned section self-contained, valid TSX, and preserve its data-landright-section id.\n\n"
+        + ("Retry guidance: " + retry_instruction.strip() + "\n" if retry_instruction.strip() else "")
+        + "Rewrite only the tracked sections below. Keep each returned section self-contained, valid TSX, preserve its data-landright-section id, and make at least one meaningful CTA-local change per returned section.\n\n"
         + selected_blocks_text
     )
     import anthropic
@@ -573,7 +702,7 @@ def _call_claude_align_cta_section_rewrite(
     try:
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=5000,
+            max_tokens=_section_rewrite_output_token_budget(),
             system=system,
             messages=[{"role": "user", "content": user}],
             temperature=temperature,
@@ -732,14 +861,29 @@ def _extract_alignment_section_rewrites(raw: str) -> list[dict]:
     text = _strip_tsx_fences((raw or "").strip())
     if not text:
         return []
-    pattern = re.compile(
-        r"<!--\s*LANDRIGHT-SECTION:(?P<section_id>[\w\-]+)\s*-->\s*(?P<tsx>[\s\S]*?)\s*<!--\s*/LANDRIGHT-SECTION\s*-->",
-        re.IGNORECASE,
-    )
     out: list[dict] = []
-    for match in pattern.finditer(text):
+    start_pattern = re.compile(r"<!--\s*LANDRIGHT-SECTION:(?P<section_id>[\w\-]+)\s*-->", re.IGNORECASE)
+    end_pattern = re.compile(r"<!--\s*/LANDRIGHT-SECTION\s*-->", re.IGNORECASE)
+    starts = list(start_pattern.finditer(text))
+    for idx, match in enumerate(starts):
         section_id = _normalize_section_key(match.group("section_id"))
-        tsx_block = (match.group("tsx") or "").strip()
+        search_start = match.end()
+        end_match = end_pattern.search(text, search_start)
+        next_start = starts[idx + 1].start() if idx + 1 < len(starts) else len(text)
+        if end_match and end_match.start() < next_start:
+            block_end = end_match.start()
+        else:
+            block_end = next_start
+        tsx_block = (text[search_start:block_end] or "").strip()
+        outer_match = re.search(
+            r"<(?P<tag>[A-Za-z][\w]*)\b(?P<attrs>[^>]*)data-landright-section\s*=\s*[\"'](?P<section_name>[^\"']+)[\"'](?P<attrs2>[^>]*)>",
+            tsx_block,
+            re.IGNORECASE,
+        )
+        if outer_match:
+            outer_end = _find_matching_close_tag(tsx_block, outer_match)
+            if outer_end is not None:
+                tsx_block = tsx_block[outer_match.start():outer_end].strip()
         if section_id and tsx_block:
             out.append({"section_id": section_id, "tsx": _strip_tsx_fences(tsx_block)})
     return out
@@ -751,6 +895,7 @@ def _apply_alignment_section_rewrites(original_tsx: str, rewrites: list[dict]) -
     blocks = _get_section_blocks(original_tsx)
     if not blocks:
         return ""
+    original_block_by_id = {block["section_id"]: block["block"] for block in blocks}
     replacement_by_id: dict[str, str] = {}
     for item in rewrites:
         section_id = _normalize_section_key(item.get("section_id"))
@@ -765,6 +910,28 @@ def _apply_alignment_section_rewrites(original_tsx: str, rewrites: list[dict]) -
             flags=re.IGNORECASE,
         )
         if f'data-landright-section="{section_id}"' not in tsx_block and f"data-landright-section='{section_id}'" not in tsx_block:
+            continue
+        valid_section, section_reason = _validate_section_block_tsx(tsx_block)
+        if not valid_section:
+            repaired = _repair_section_block_tsx(
+                section_id=section_id,
+                original_block=original_block_by_id.get(section_id, ""),
+                broken_block=tsx_block,
+                validation_reason=section_reason,
+            )
+            if repaired:
+                repaired = re.sub(
+                    r'(data-landright-section\s*=\s*["\'])([^"\']+)(["\'])',
+                    lambda m: f"{m.group(1)}{section_id}{m.group(3)}",
+                    repaired,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                repaired_ok, _ = _validate_section_block_tsx(repaired)
+                if repaired_ok:
+                    tsx_block = repaired
+                    valid_section = True
+        if not valid_section:
             continue
         replacement_by_id[section_id] = tsx_block
     if not replacement_by_id:
@@ -1076,6 +1243,7 @@ def _call_claude_align_cta(
         + "Return the complete modified TSX file, not JSON and not a patch. "
         + "You may change CTA count, CTA placement, CTA prominence, CTA labels, and CTA-local wrappers, but keep the same overall design language, layout personality, palette, typography, spacing feel, and variant identity. "
         + "Make the CTA strategy more similar to the winner, not identical to it. "
+        + "You must make at least one meaningful CTA-local change so the result is committable. "
         + "Do not flatten the page into the winner's exact structure. "
         + "Do not introduce new React state, helper functions, modal toggles, undefined handlers, or synthetic embed behavior. "
         + "If the file already contains Calendly, scripts, imports, or data-landright-section attributes, preserve them. "
@@ -1115,6 +1283,7 @@ def _call_claude_align_cta(
     user_prefix_base += (
         "Rewrite the full file while changing only what is needed to improve CTA structure. "
         "Keep the variant distinct from the winner outside CTA-local areas. "
+        "Make at least one meaningful CTA-local change so the result is actually committable. "
         "Do not modify Calendly behavior, scripts, imports, data-landright-section attributes, or layout scaffolding. "
         "Do not output markdown or explanation."
     )
@@ -1183,7 +1352,7 @@ def _call_claude_align_cta(
     try:
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=7000,
+            max_tokens=_alignment_output_token_budget(),
             system=system,
             messages=[{"role": "user", "content": user}],
             temperature=temperature,
@@ -1592,6 +1761,7 @@ def _run_learning_step() -> None:
             if dedup_key in _GENERATION_LESSONS_WRITTEN:
                 continue
             lesson = f"When {best_id} outperformed (repo {repo}), it had: " + "; ".join(str(p) for p in diff_parts) + ". Prefer these patterns in future generations."
+            _append_experience_file(EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED, lesson)
             _insert_experience_entry_supabase("generation", lesson)
             _GENERATION_LESSONS_WRITTEN.add(dedup_key)
             log.info("Learning: inserted generation lesson for %s %s", repo, layer)
@@ -1774,16 +1944,16 @@ def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[st
     best_time_val = times.get(best_id)
     # Run Claude CTA-align sequentially (max_workers=1) to avoid rate-limit retries; push each variant as it completes.
     log.info("Running CTA align for %s sequentially (%s variants)", repo_full_name, len(underperforming))
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future_to_vid = {
-            executor.submit(
-                _call_claude_align_cta,
-                FRONTEND_DESIGN_SKILL,
-                cta_description,
-                files[vid],
-                best_id,
+    for vid in underperforming:
+        try:
+            new_tsx = _generate_aligned_variant_with_retries(
+                repo_full_name=repo_full_name,
+                layer=layer,
+                variant_id=vid,
+                current_tsx=files[vid],
+                best_id=best_id,
+                cta_description=cta_description,
                 experience_library=experience_lib,
-                underperforming_variant_id=vid,
                 best_cta_count=best_cta_count,
                 best_clicks=best_clicks_val,
                 best_time_sec=best_time_val,
@@ -1791,36 +1961,23 @@ def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[st
                 underperforming_time_sec=times.get(vid),
                 best_section_times=section_time_by_variant.get(best_id, {}),
                 underperforming_section_times=section_time_by_variant.get(vid, {}),
-            ): vid
-            for vid in underperforming
-        }
-        for future in as_completed(future_to_vid):
-            vid = future_to_vid[future]
-            try:
-                new_tsx = future.result()
-                log.info("Claude align completed for %s (%s)", vid, repo_full_name)
-                if new_tsx:
-                    is_runnable, validation_reason = _validate_variant_tsx_runnable(new_tsx)
-                    if not is_runnable:
-                        log.warning("Skipping push for %s: generated TSX is not runnable (%s)", vid, validation_reason)
-                        _record_snapshot_supabase(repo_full_name, layer, vid, files[vid], "agent_adjust")
-                        continue
-                    log.info("Pushing %s for %s (branch: default)", vid, repo_full_name)
-                    _push_variant_file(repo_full_name, vid, new_tsx, commit_msg)
-                    _record_snapshot_supabase(repo_full_name, layer, vid, new_tsx, "agent_adjust")
-                    pushed += 1
-                    log.info("Pushed updated %s for %s layer %s", vid, repo_full_name, layer)
-                else:
-                    log.warning("Skipping push for %s: Claude returned no content", vid)
-                    _record_snapshot_supabase(repo_full_name, layer, vid, files[vid], "agent_adjust")
-            except Exception as e:
-                if "timeout" in str(e).lower() or "timed out" in str(e).lower():
-                    log.warning(
-                        "Claude CTA-align timed out for %s (timeout=%ss). Increase CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS if needed.",
-                        vid, CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS,
-                    )
-                log.exception("Failed to update %s: %s", vid, e)
+            )
+            if new_tsx:
+                log.info("Pushing %s for %s (branch: default)", vid, repo_full_name)
+                _push_variant_file(repo_full_name, vid, new_tsx, commit_msg)
+                _record_snapshot_supabase(repo_full_name, layer, vid, new_tsx, "agent_adjust")
+                pushed += 1
+                log.info("Pushed updated %s for %s layer %s", vid, repo_full_name, layer)
+            else:
                 _record_snapshot_supabase(repo_full_name, layer, vid, files[vid], "agent_adjust")
+        except Exception as e:
+            if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+                log.warning(
+                    "Claude CTA-align timed out for %s (timeout=%ss). Increase CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS if needed.",
+                    vid, CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS,
+                )
+            log.exception("Failed to update %s: %s", vid, e)
+            _record_snapshot_supabase(repo_full_name, layer, vid, files[vid], "agent_adjust")
     _record_snapshot_supabase(repo_full_name, layer, best_id, files[best_id], "agent_adjust")
     if pushed > 0:
         _write_adjustment_log(repo_full_name, layer, best_id, normalized, times_before=times if times else None)

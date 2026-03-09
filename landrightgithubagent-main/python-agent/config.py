@@ -68,3 +68,13 @@ EXPERIENCE_LIBRARY_DATA_ANALYST_PATH = (
 EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED = (
     Path(EXPERIENCE_LIBRARY_DATA_ANALYST_PATH).expanduser().resolve() if EXPERIENCE_LIBRARY_DATA_ANALYST_PATH else None
 )
+
+# Generation: append durable lessons into the backend's default library so future frontend/backend
+# generations can benefit from what the agent learns from winning variants.
+EXPERIENCE_LIBRARY_GENERATION_PATH = (
+    os.environ.get("EXPERIENCE_LIBRARY_GENERATION_PATH")
+    or str(AGENT_DIR.parent.parent / "landright-app" / "backend" / "experience_library_default.json")
+).strip()
+EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED = (
+    Path(EXPERIENCE_LIBRARY_GENERATION_PATH).expanduser().resolve() if EXPERIENCE_LIBRARY_GENERATION_PATH else None
+)
