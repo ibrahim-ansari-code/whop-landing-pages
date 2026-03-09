@@ -3,10 +3,11 @@ Landright GitHub agent: FastAPI service with POST /sync, GET /health, and a back
 that polls Supabase cta_by_variant every 10 seconds and runs an adjust-variants pipeline (then commits)
 when best - second_best CTA clicks >= threshold. Design guidance from frontend-design-skill.md.
 """
+import difflib
+import json
 import logging
 import os
 import re
-import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -421,16 +422,24 @@ def _strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
+def _normalize_cta_label(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").strip().lower()).strip()
+
+
 def _count_changed_lines(old: str, new: str) -> int:
     old_lines = (old or "").splitlines()
     new_lines = (new or "").splitlines()
     changed = 0
-    max_len = max(len(old_lines), len(new_lines))
-    for idx in range(max_len):
-        left = old_lines[idx] if idx < len(old_lines) else None
-        right = new_lines[idx] if idx < len(new_lines) else None
-        if left != right:
-            changed += 1
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace":
+            changed += max(i2 - i1, j2 - j1)
+        elif tag == "delete":
+            changed += i2 - i1
+        elif tag == "insert":
+            changed += j2 - j1
     return changed
 
 
@@ -450,6 +459,146 @@ def _extract_json_object(raw: str) -> dict | None:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _extract_alignment_tsx(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    plan = _extract_json_object(text)
+    if isinstance(plan, dict):
+        for key in ("tsx", "code", "content"):
+            value = plan.get(key)
+            if isinstance(value, str) and value.strip():
+                return _strip_tsx_fences(value)
+    return _strip_tsx_fences(text)
+
+
+def _extract_section_ids(tsx: str) -> list[str]:
+    return re.findall(r'data-landright-section\s*=\s*["\']([^"\']+)["\']', tsx or "", re.IGNORECASE)
+
+
+def _validate_alignment_candidate(original_tsx: str, candidate_tsx: str) -> tuple[bool, str]:
+    original = (original_tsx or "").strip()
+    candidate = (candidate_tsx or "").strip()
+    if not candidate:
+        return False, "empty output"
+    if candidate == original:
+        return False, "no change"
+    original_lower = original.lower()
+    candidate_lower = candidate.lower()
+    if '"use client"' in original_lower and '"use client"' not in candidate_lower and "'use client'" not in candidate_lower:
+        return False, 'missing "use client"'
+    for token in ("calendly", "widget.js", "<script"):
+        if token in original_lower and token not in candidate_lower:
+            return False, f"missing frozen token {token}"
+    original_sections = [_normalize_section_key(section_id) for section_id in _extract_section_ids(original)]
+    candidate_sections = [_normalize_section_key(section_id) for section_id in _extract_section_ids(candidate)]
+    if original_sections:
+        missing_sections = [section_id for section_id in original_sections if section_id not in set(candidate_sections)]
+        if missing_sections:
+            return False, f"missing tracked sections: {', '.join(missing_sections[:5])}"
+    if len(candidate) < max(500, int(len(original) * 0.55)):
+        return False, "output shrank too much"
+    return True, "ok"
+
+
+def _call_claude_align_cta_section_rewrite(
+    design_skill: str,
+    best_cta_description: str,
+    underperforming_tsx: str,
+    *,
+    best_variant_id: str,
+    underperforming_variant_id: str | None = None,
+    best_clicks: int | None = None,
+    best_time_sec: float | None = None,
+    underperforming_clicks: int | None = None,
+    underperforming_time_sec: float | None = None,
+    best_section_times: dict[str, float] | None = None,
+    underperforming_section_times: dict[str, float] | None = None,
+    experience_library: list[str] | None = None,
+    temperature: float = 0.0,
+) -> str:
+    editable_sections = _select_alignment_sections(underperforming_tsx, underperforming_section_times, limit=3)
+    if not editable_sections:
+        return ""
+    tracked_sections = _extract_section_ids(underperforming_tsx)
+    experiences_block = ""
+    if experience_library:
+        bullets = "\n".join(f"• {e}" for e in experience_library[:20])
+        experiences_block = "\n\nUse this CTA learning context when relevant:\n" + bullets
+    selected_blocks_text = "\n\n".join(
+        f"SECTION {item['section_id']}:\n{item['block']}" for item in editable_sections
+    )
+    best_metrics = []
+    if best_clicks is not None:
+        best_metrics.append(f"{best_clicks} CTA clicks")
+    if best_time_sec is not None and best_time_sec > 0:
+        best_metrics.append(f"{int(round(best_time_sec))}s time on page")
+    under_metrics = []
+    if underperforming_clicks is not None:
+        under_metrics.append(f"{underperforming_clicks} CTA clicks")
+    if underperforming_time_sec is not None and underperforming_time_sec > 0:
+        under_metrics.append(f"{int(round(underperforming_time_sec))}s time on page")
+    system = (
+        design_skill
+        + "\n\n---\n\n"
+        + "You are revising CTA-related tracked sections of an underperforming landing page variant. "
+        + "Return only the rewritten tracked sections using this exact wrapper format for each changed section:\n"
+        + "<!-- LANDRIGHT-SECTION:hero -->\n<section data-landright-section=\"hero\">...</section>\n<!-- /LANDRIGHT-SECTION -->\n"
+        + "Only include tracked sections you are changing. "
+        + "Within those sections you have full control over CTA structure, CTA prominence, CTA labels, CTA-local wrappers, and CTA placement. "
+        + "Keep the variant's design language and overall identity intact, and make it more similar to the winner's CTA strategy without copying it exactly. "
+        + "Do not introduce new React state, helper functions, modal toggles, undefined handlers, or fake embed behavior. "
+        + "Preserve any existing embed/widget/script markup if it appears inside a returned section. "
+        + "Do not rename or remove data-landright-section values. "
+        + "Output only the wrapped section blocks, with no explanation."
+        + experiences_block
+    )
+    user = (
+        f"Best-performing variant: {best_variant_id}. CTA structure summary: {best_cta_description}\n"
+        + (f"Best metrics: {', '.join(best_metrics)}.\n" if best_metrics else "")
+        + (f"Underperforming variant {underperforming_variant_id} metrics: {', '.join(under_metrics)}.\n" if under_metrics else "")
+        + f"Tracked sections in the full file that must still exist: {', '.join(tracked_sections) if tracked_sections else 'none'}.\n"
+        + f"Highest-engagement sections in the best variant: {_summarize_section_engagement(best_section_times or {})}.\n"
+        + f"Highest-engagement sections in the underperforming variant: {_summarize_section_engagement(underperforming_section_times or {})}.\n"
+        + "Rewrite only the tracked sections below. Keep each returned section self-contained, valid TSX, and preserve its data-landright-section id.\n\n"
+        + selected_blocks_text
+    )
+    import anthropic
+    client = anthropic.Anthropic(
+        timeout=float(CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS),
+        max_retries=2,
+    )
+    try:
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=5000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            temperature=temperature,
+        )
+    except Exception as e:
+        log.warning("CTA section-rewrite LLM failed: %s", e)
+        return ""
+    text = ""
+    for b in msg.content:
+        if hasattr(b, "text"):
+            text += b.text
+    preview = (text.strip()[:300] + "…") if len(text.strip()) > 300 else text.strip()
+    rewrites = _extract_alignment_section_rewrites(text)
+    if not rewrites:
+        log.warning("CTA section-rewrite returned invalid section blocks; preview=%r", preview)
+        return ""
+    candidate = _apply_alignment_section_rewrites(underperforming_tsx, rewrites)
+    if not candidate:
+        log.warning("CTA section-rewrite could not be applied; preview=%r", preview)
+        return ""
+    ok, reason = _validate_alignment_candidate(underperforming_tsx, candidate)
+    if not ok:
+        log.warning("CTA section-rewrite returned invalid TSX (%s); preview=%r", reason, preview)
+        return ""
+    return candidate
 
 
 def _contains_frozen_markup(snippet: str) -> bool:
@@ -508,6 +657,134 @@ def _section_for_pos(ranges: list[dict], pos: int) -> str | None:
         if rng["start"] <= pos < rng["end"]:
             return rng["section_id"]
     return None
+
+
+def _find_matching_close_tag(tsx: str, open_match: re.Match[str]) -> int | None:
+    tag = open_match.group("tag")
+    token_re = re.compile(rf"</?{re.escape(tag)}\b[^>]*>", re.IGNORECASE)
+    depth = 0
+    for token in token_re.finditer(tsx, open_match.start()):
+        text = token.group(0)
+        is_close = text.startswith("</")
+        self_closing = text.endswith("/>")
+        if not is_close:
+            depth += 1
+            if self_closing:
+                depth -= 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return token.end()
+    return None
+
+
+def _get_section_blocks(tsx: str) -> list[dict]:
+    pattern = re.compile(
+        r"<(?P<tag>[A-Za-z][\w]*)\b(?P<attrs>[^>]*)data-landright-section\s*=\s*[\"'](?P<section_id>[^\"']+)[\"'](?P<attrs2>[^>]*)>",
+        re.IGNORECASE,
+    )
+    blocks: list[dict] = []
+    for match in pattern.finditer(tsx or ""):
+        end = _find_matching_close_tag(tsx, match)
+        if end is None:
+            continue
+        blocks.append({
+            "section_id": _normalize_section_key(match.group("section_id")),
+            "start": match.start(),
+            "end": end,
+            "block": tsx[match.start():end],
+            "tag": match.group("tag"),
+        })
+    return blocks
+
+
+def _select_alignment_sections(tsx: str, section_times: dict[str, float] | None = None, limit: int = 3) -> list[dict]:
+    blocks = _get_section_blocks(tsx)
+    if not blocks:
+        return []
+    section_times = section_times or {}
+    candidates = _find_cta_candidates(tsx, _get_section_ranges(tsx))
+    ranked_ids: list[str] = []
+    for candidate in candidates:
+        section_id = _normalize_section_key(candidate.get("section_id"))
+        if section_id and section_id not in ranked_ids:
+            ranked_ids.append(section_id)
+    for section_id, _ in sorted(section_times.items(), key=lambda item: -float(item[1] or 0)):
+        normalized = _normalize_section_key(section_id)
+        if normalized and normalized not in ranked_ids:
+            ranked_ids.append(normalized)
+    for preferred in ("hero", "pricing", "cta", "footer"):
+        if preferred not in ranked_ids and any(block["section_id"] == preferred for block in blocks):
+            ranked_ids.append(preferred)
+    selected: list[dict] = []
+    for section_id in ranked_ids:
+        block = next((b for b in blocks if b["section_id"] == section_id), None)
+        if block and block not in selected:
+            selected.append(block)
+        if len(selected) >= limit:
+            break
+    if not selected:
+        selected.append(blocks[0])
+    return selected
+
+
+def _extract_alignment_section_rewrites(raw: str) -> list[dict]:
+    text = _strip_tsx_fences((raw or "").strip())
+    if not text:
+        return []
+    pattern = re.compile(
+        r"<!--\s*LANDRIGHT-SECTION:(?P<section_id>[\w\-]+)\s*-->\s*(?P<tsx>[\s\S]*?)\s*<!--\s*/LANDRIGHT-SECTION\s*-->",
+        re.IGNORECASE,
+    )
+    out: list[dict] = []
+    for match in pattern.finditer(text):
+        section_id = _normalize_section_key(match.group("section_id"))
+        tsx_block = (match.group("tsx") or "").strip()
+        if section_id and tsx_block:
+            out.append({"section_id": section_id, "tsx": _strip_tsx_fences(tsx_block)})
+    return out
+
+
+def _apply_alignment_section_rewrites(original_tsx: str, rewrites: list[dict]) -> str:
+    if not rewrites:
+        return ""
+    blocks = _get_section_blocks(original_tsx)
+    if not blocks:
+        return ""
+    replacement_by_id: dict[str, str] = {}
+    for item in rewrites:
+        section_id = _normalize_section_key(item.get("section_id"))
+        tsx_block = (item.get("tsx") or "").strip()
+        if not section_id or not tsx_block:
+            continue
+        tsx_block = re.sub(
+            r'(data-landright-section\s*=\s*["\'])([^"\']+)(["\'])',
+            lambda m: f"{m.group(1)}{section_id}{m.group(3)}",
+            tsx_block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if f'data-landright-section="{section_id}"' not in tsx_block and f"data-landright-section='{section_id}'" not in tsx_block:
+            continue
+        replacement_by_id[section_id] = tsx_block
+    if not replacement_by_id:
+        return ""
+    parts: list[str] = []
+    cursor = 0
+    applied = 0
+    for block in sorted(blocks, key=lambda item: item["start"]):
+        parts.append(original_tsx[cursor:block["start"]])
+        replacement = replacement_by_id.get(block["section_id"])
+        if replacement:
+            parts.append(replacement)
+            applied += 1
+        else:
+            parts.append(block["block"])
+        cursor = block["end"]
+    parts.append(original_tsx[cursor:])
+    if applied == 0:
+        return ""
+    return "".join(parts)
 
 
 def _find_cta_candidates(tsx: str, section_ranges: list[dict]) -> list[dict]:
@@ -577,6 +854,26 @@ def _insert_cta_into_section(tsx: str, target_section: dict, cta_tag: str) -> st
     return tsx[:insert_at] + "\n" + cta_tag + tsx[insert_at:]
 
 
+def _sanitize_cta_html(new_html: str, fallback_label: str = "") -> str:
+    """Keep LLM-generated CTA markup when possible, but strip obviously unrunnable handlers."""
+    snippet = (new_html or "").strip()
+    if not snippet:
+        return ""
+    # Claude sometimes invents local state handlers that do not exist in the file.
+    snippet = re.sub(r"\s+onClick=\{[^{}]*set[A-Z][^{}]*\}", "", snippet)
+    snippet = re.sub(r"\s+onClick=\{[^{}]*(?:Calendly|Modal|Popup|Dialog|Open)[^{}]*\}", "", snippet)
+    snippet = re.sub(r"\s+onClick=\"[^\"]*\"", "", snippet)
+    snippet = re.sub(r"\s+onClick='[^']*'", "", snippet)
+    if _contains_frozen_markup(snippet):
+        return ""
+    if re.search(r"<button\b", snippet, re.IGNORECASE) and not re.search(r"<button\b[^>]*\btype=", snippet, re.IGNORECASE):
+        snippet = re.sub(r"<button\b", "<button type=\"button\"", snippet, count=1, flags=re.IGNORECASE)
+    if re.search(r"<(?:a|button|Button|Link)\b", snippet, re.IGNORECASE):
+        return snippet
+    label = (fallback_label or "").strip() or "Get Started"
+    return f'<button type="button" className="inline-flex items-center rounded-xl bg-zinc-900 px-6 py-3 text-sm font-semibold text-white">{label}</button>'
+
+
 def _build_fallback_cta_ops(
     tsx: str,
     *,
@@ -630,6 +927,56 @@ def _build_fallback_cta_ops(
     }]
 
 
+def _build_last_resort_cta_ops(tsx: str, section_times: dict[str, float] | None = None) -> list[dict]:
+    """Always try to produce one tiny, safe CTA diff when normal planning cannot be applied."""
+    section_ranges = _get_section_ranges(tsx)
+    candidates = _find_cta_candidates(tsx, section_ranges)
+    if not candidates:
+        return []
+    section_times = section_times or {}
+    primary = max(candidates, key=lambda c: float(section_times.get(c.get("section_id") or "", 0)))
+    label = primary["label"]
+    normalized = _normalize_cta_label(label)
+    if " now" not in f" {normalized} ":
+        new_label = f"{label} Now"
+    elif " today" not in f" {normalized} ":
+        new_label = f"{label} Today"
+    else:
+        new_label = f"{label}!"
+    return [{
+        "op": "relabel_cta",
+        "source_label": label,
+        "new_label": new_label,
+    }]
+
+
+def _find_matching_cta_candidate(candidates: list[dict], source_label: str) -> dict | None:
+    if not candidates:
+        return None
+    if not source_label:
+        return candidates[0]
+    exact = next((c for c in candidates if c["label"] == source_label), None)
+    if exact:
+        return exact
+    normalized_source = _normalize_cta_label(source_label)
+    if not normalized_source:
+        return candidates[0]
+    normalized_matches = [
+        c for c in candidates
+        if _normalize_cta_label(c.get("label") or "") == normalized_source
+    ]
+    if normalized_matches:
+        return normalized_matches[0]
+    partial_matches = [
+        c for c in candidates
+        if normalized_source in _normalize_cta_label(c.get("label") or "")
+        or _normalize_cta_label(c.get("label") or "") in normalized_source
+    ]
+    if partial_matches:
+        return partial_matches[0]
+    return None
+
+
 def _apply_cta_ops(tsx: str, operations: list[dict]) -> str:
     updated = tsx
     applied = 0
@@ -640,9 +987,10 @@ def _apply_cta_ops(tsx: str, operations: list[dict]) -> str:
         source_label = (op.get("source_label") or op.get("label") or "").strip()
         new_label = (op.get("new_label") or "").strip()
         new_html = (op.get("new_html") or "").strip()
-        target_section = _find_target_section(section_ranges, op.get("target_section"))
+        target_section = _find_target_section(section_ranges, op.get("target_section") or op.get("section"))
+        safe_new_html = _sanitize_cta_html(new_html, new_label or source_label)
 
-        source = next((c for c in candidates if c["label"] == source_label), None)
+        source = _find_matching_cta_candidate(candidates, source_label)
         if op_name == "relabel_cta" and source and new_label:
             replacement = _replace_inner_text(source["full_tag"], new_label)
             updated = updated[: source["start"]] + replacement + updated[source["end"] :]
@@ -650,23 +998,26 @@ def _apply_cta_ops(tsx: str, operations: list[dict]) -> str:
         elif op_name == "remove_cta" and source:
             updated = updated[: source["start"]] + updated[source["end"] :]
             applied += 1
-        elif op_name in {"duplicate_cta", "add_cta"} and source and target_section:
-            duplicate = new_html if new_html and not _contains_frozen_markup(new_html) else (
-                _replace_inner_text(source["full_tag"], new_label) if new_label else source["full_tag"]
-            )
+        elif op_name == "add_cta" and target_section:
+            inserted = safe_new_html
+            if not inserted and source:
+                inserted = _replace_inner_text(source["full_tag"], new_label) if new_label else source["full_tag"]
+            if inserted:
+                updated = _insert_cta_into_section(updated, target_section, inserted)
+                applied += 1
+        elif op_name == "duplicate_cta" and source and target_section:
+            duplicate = safe_new_html or (_replace_inner_text(source["full_tag"], new_label) if new_label else source["full_tag"])
             updated = _insert_cta_into_section(updated, target_section, duplicate)
             applied += 1
         elif op_name == "move_cta" and source and target_section:
-            moved = new_html if new_html and not _contains_frozen_markup(new_html) else (
-                _replace_inner_text(source["full_tag"], new_label) if new_label else source["full_tag"]
-            )
+            moved = safe_new_html or (_replace_inner_text(source["full_tag"], new_label) if new_label else source["full_tag"])
             without_source = updated[: source["start"]] + updated[source["end"] :]
-            target_section_after_remove = _find_target_section(_get_section_ranges(without_source), op.get("target_section"))
+            target_section_after_remove = _find_target_section(_get_section_ranges(without_source), op.get("target_section") or op.get("section"))
             if target_section_after_remove:
                 updated = _insert_cta_into_section(without_source, target_section_after_remove, moved)
                 applied += 1
-        elif op_name == "replace_cta_block" and source and new_html and not _contains_frozen_markup(new_html):
-            updated = updated[: source["start"]] + new_html + updated[source["end"] :]
+        elif op_name == "replace_cta_block" and source and safe_new_html:
+            updated = updated[: source["start"]] + safe_new_html + updated[source["end"] :]
             applied += 1
     if applied == 0:
         return ""
@@ -697,7 +1048,7 @@ def _call_claude_align_cta(
     best_section_times: dict[str, float] | None = None,
     underperforming_section_times: dict[str, float] | None = None,
 ) -> str:
-    """Ask Claude for a small CTA-only operation plan, then apply those operations deterministically."""
+    """Ask Claude to rewrite the full TSX with CTA-local structural improvements."""
     raw_tsx = (underperforming_tsx or "").strip()
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
@@ -717,26 +1068,21 @@ def _call_claude_align_cta(
         experiences_block = intro + bullets
     section_ranges = _get_section_ranges(raw_tsx)
     candidates = _find_cta_candidates(raw_tsx, section_ranges)
-    fallback_ops = _build_fallback_cta_ops(
-        raw_tsx,
-        section_times=underperforming_section_times,
-        desired_cta_count=best_cta_count,
-    )
+    tracked_sections = _extract_section_ids(raw_tsx)
     system = (
         design_skill
         + "\n\n---\n\n"
         + "You are aligning an underperforming landing variant to the CTA structure of the best-performing variant. "
-        + "Do not rewrite the whole TSX file. Return only a JSON object describing 1 to 5 CTA operations. "
-        + "Allowed operations are: add_cta, remove_cta, move_cta, relabel_cta, duplicate_cta, replace_cta_block. "
-        + "You may redesign CTA buttons/links and small CTA-local wrappers, but only around the CTA block itself. "
-        + "Do not rewrite non-CTA copy, layout, imports, section wrappers, data-landright-section attributes, scripts, Calendly embed/widget markup, or layout containers. "
-        + "Never touch Calendly, scripts, section wrappers, data-landright-section, imports, or layout containers. "
-        + "Preserve the frozen parts exactly, but you have freedom over CTA structure, CTA styling, CTA text, and CTA-local presentation outside those frozen areas. "
-        + "Prefer a commitable, meaningful diff over returning nothing. "
-        + "Alignment is based on both CTA clicks and time on page; prefer CTA placement in high-engagement sections (e.g. Hero, sections that get more view time). "
-        + "Return at least one operation whenever a safe CTA change is possible. "
-        + "Output format must be strict JSON: "
-        + '{"operations":[{"op":"replace_cta_block","source_label":"Get Started","new_html":"<a className=\\"inline-flex rounded-xl bg-black px-6 py-3 text-white\\">Start Free</a>"}]}.'
+        + "Return the complete modified TSX file, not JSON and not a patch. "
+        + "You may change CTA count, CTA placement, CTA prominence, CTA labels, and CTA-local wrappers, but keep the same overall design language, layout personality, palette, typography, spacing feel, and variant identity. "
+        + "Make the CTA strategy more similar to the winner, not identical to it. "
+        + "Do not flatten the page into the winner's exact structure. "
+        + "Do not introduce new React state, helper functions, modal toggles, undefined handlers, or synthetic embed behavior. "
+        + "If the file already contains Calendly, scripts, imports, or data-landright-section attributes, preserve them. "
+        + "Preserve every existing data-landright-section id and keep the tracked sections in the same order. "
+        + "Preserve the file's existing imports and top-level structure. "
+        + "Prefer self-contained CTA markup such as <a> or <button type=\"button\"> when introducing or upgrading CTAs. "
+        + "Output only the final TSX file."
         + experiences_block
     )
     user_prefix_base = (
@@ -762,16 +1108,15 @@ def _call_claude_align_cta(
         user_prefix_base += "Prefer placing or reinforcing CTAs in sections that get more view time (e.g. Hero, above-fold) so engagement and time-on-page are both considered.\n\n"
     user_prefix_base += (
         f"Detected safe CTA candidates in the underperforming variant: {_summarize_cta_candidates(candidates)}.\n"
+        f"Tracked sections that must still exist after editing: {', '.join(tracked_sections) if tracked_sections else 'none'}.\n"
         f"Highest-engagement sections in the underperforming variant: {_summarize_section_engagement(underperforming_section_times or {})}.\n"
         f"Highest-engagement sections in the best variant: {_summarize_section_engagement(best_section_times or {})}.\n"
     )
     user_prefix_base += (
-        "Produce only a JSON operation plan for CTA-only edits. "
-        "Use 1 to 5 operations from this set: add_cta, remove_cta, move_cta, relabel_cta, duplicate_cta, replace_cta_block. "
-        "Only target CTA elements and small CTA-local wrappers, and prefer sections with higher engagement/time. "
-        "Do not modify Calendly, scripts, section wrappers, data-landright-section attributes, imports, or layout containers. "
-        "If there is any safe CTA candidate, do not return an empty plan because we need a real commitable diff. "
-        "Do not output TSX, markdown, or explanation."
+        "Rewrite the full file while changing only what is needed to improve CTA structure. "
+        "Keep the variant distinct from the winner outside CTA-local areas. "
+        "Do not modify Calendly behavior, scripts, imports, data-landright-section attributes, or layout scaffolding. "
+        "Do not output markdown or explanation."
     )
 
     max_chars = min(len(raw_tsx), MAX_VARIANT_CHARS_FOR_CTA_ALIGN)
@@ -782,12 +1127,27 @@ def _call_claude_align_cta(
             "Variant TSX truncated to %s chars for Claude request (200k token limit)",
             max_chars,
         )
+        return _call_claude_align_cta_section_rewrite(
+            design_skill,
+            best_cta_description,
+            raw_tsx,
+            best_variant_id=best_variant_id,
+            underperforming_variant_id=underperforming_variant_id,
+            best_clicks=best_clicks,
+            best_time_sec=best_time_sec,
+            underperforming_clicks=underperforming_clicks,
+            underperforming_time_sec=underperforming_time_sec,
+            best_section_times=best_section_times,
+            underperforming_section_times=underperforming_section_times,
+            experience_library=experience_library,
+            temperature=temperature,
+        )
 
     # Only run count_tokens when we might be near token limit (saves round-trips for typical 70k cap).
     if max_chars > CHAR_THRESHOLD_FOR_TOKEN_CHECK:
         for attempt in range(5):
             prefix_with_note = user_prefix_base + (
-                "\n\nThe file was truncated; output a JSON operation plan that only changes visible CTA elements. Do not assume you can edit hidden sections." if truncated else ""
+                "\n\nThe file was truncated; preserve visible design and return a full TSX file that only changes visible CTA-local areas. Do not assume you can edit hidden sections." if truncated else ""
             )
             user = prefix_with_note + "\n\n" + tsx_to_send
             try:
@@ -817,32 +1177,31 @@ def _call_claude_align_cta(
             )
 
     final_user_prefix = user_prefix_base + (
-        "\n\nThe file was truncated; output only a JSON operation plan for visible CTA elements. Preserve all non-CTA structure exactly." if truncated else ""
+        "\n\nThe file was truncated; output a full TSX file and only change visible CTA-local areas while preserving the overall page design and structure." if truncated else ""
     )
     user = final_user_prefix + "\n\n" + tsx_to_send
     try:
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=1200,
+            max_tokens=7000,
             system=system,
             messages=[{"role": "user", "content": user}],
             temperature=temperature,
         )
     except Exception as e:
-        log.warning("CTA-align LLM failed, using deterministic fallback ops: %s", e)
-        return _apply_cta_ops(raw_tsx, fallback_ops)
+        log.warning("CTA-align LLM failed: %s", e)
+        return ""
     text = ""
     for b in msg.content:
         if hasattr(b, "text"):
             text += b.text
-    plan = _extract_json_object(text.strip())
-    if not isinstance(plan, dict):
-        log.warning("CTA-align returned non-JSON plan; skipping")
-        return _apply_cta_ops(raw_tsx, fallback_ops)
-    operations = plan.get("operations")
-    if not isinstance(operations, list) or not operations:
-        return _apply_cta_ops(raw_tsx, fallback_ops)
-    return _apply_cta_ops(raw_tsx, operations)
+    preview = (text.strip()[:300] + "…") if len(text.strip()) > 300 else text.strip()
+    candidate = _extract_alignment_tsx(text.strip())
+    ok, reason = _validate_alignment_candidate(raw_tsx, candidate)
+    if not ok:
+        log.warning("CTA-align returned invalid TSX (%s); preview=%r", reason, preview)
+        return ""
+    return candidate
 
 
 def _strip_tsx_fences(raw: str) -> str:
