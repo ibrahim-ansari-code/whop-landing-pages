@@ -134,6 +134,26 @@ export async function POST(request: NextRequest) {
   const errors: string[] = [];
   const filePaths = Object.keys(files).sort();
 
+  try {
+    const healthRes = await fetch(`${syncAgentUrl}/health`, { method: "GET" });
+    if (!healthRes.ok) {
+      return NextResponse.json(
+        {
+          error: `Sync agent at ${syncAgentUrl} returned ${healthRes.status}. Start the agent (e.g. port 4000) and set SYNC_AGENT_URL in .env.local.`,
+        },
+        { status: 503 }
+      );
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Connection failed";
+    return NextResponse.json(
+      {
+        error: `Cannot reach sync agent at ${syncAgentUrl}. ${msg} Start the Python agent and set SYNC_AGENT_URL in .env.local.`,
+      },
+      { status: 503 }
+    );
+  }
+
   for (const filePath of filePaths) {
     const payload: { filePath: string; data: string; commitMessage: string; repo_full_name?: string } = {
       filePath,

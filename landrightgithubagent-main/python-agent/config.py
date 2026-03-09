@@ -31,9 +31,9 @@ DESIGN_SKILL_PATH = (os.environ.get("DESIGN_SKILL_PATH") or str(AGENT_DIR / "fro
 DESIGN_SKILL_PATH_RESOLVED = Path(DESIGN_SKILL_PATH).expanduser().resolve() if DESIGN_SKILL_PATH else None
 
 # Cron: threshold for triggering adjust (best_cta_clicks - second_best >= CTA_THRESHOLD)
-CTA_THRESHOLD = max(0, int(os.environ.get("CTA_THRESHOLD", "5")))
+CTA_THRESHOLD = max(0, int(os.environ.get("CTA_THRESHOLD", "50")))
 # Poll Supabase every N seconds, then run adjust pipeline and commit when threshold met
-CRON_INTERVAL_SECONDS = max(1, int(os.environ.get("CRON_INTERVAL_SECONDS", "10")))
+CRON_INTERVAL_SECONDS = max(1, int(os.environ.get("CRON_INTERVAL_SECONDS", "5")))
 # Safety guard: max commit cycles per repo/layer in a rolling window
 MAX_ADJUST_COMMITS_PER_WINDOW = max(1, int(os.environ.get("MAX_ADJUST_COMMITS_PER_WINDOW", "3")))
 ADJUST_COMMIT_WINDOW_SECONDS = max(60, int(os.environ.get("ADJUST_COMMIT_WINDOW_SECONDS", "3600")))
@@ -53,6 +53,13 @@ EXPERIENCE_LIBRARY_CTA_PATH = (
 EXPERIENCE_LIBRARY_CTA_PATH_RESOLVED = (
     Path(EXPERIENCE_LIBRARY_CTA_PATH).expanduser().resolve() if EXPERIENCE_LIBRARY_CTA_PATH else None
 )
+
+# Claude CTA-align: request timeout (seconds). Keep prompts small so this is rarely hit.
+CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS = max(120, int(os.environ.get("CLAUDE_CTA_ALIGN_TIMEOUT_SECONDS", "300")))
+
+# Max variant TSX chars sent to Claude. Keep this relatively small because CTA-align now returns
+# a compact operation plan instead of a full-file rewrite.
+MAX_VARIANT_CHARS_FOR_CTA_ALIGN = max(12_000, min(200_000, int(os.environ.get("MAX_VARIANT_CHARS_FOR_CTA_ALIGN", "18000"))))
 
 # Data analyst: experience library for LLM judge (when to run adjust pipeline); built by scripts/build_data_analyst_experience_library.py
 EXPERIENCE_LIBRARY_DATA_ANALYST_PATH = (

@@ -11,6 +11,7 @@ type DashboardVariant = {
   cta_clicks: number;
   share_percent: number;
   rank?: number;
+  total_seconds?: number;
 };
 
 type DashboardEvent = {
@@ -39,6 +40,15 @@ type VariantAnalysis = {
   lineCount: number;
 };
 
+type ChatMessage = { role: "user" | "assistant"; content: string };
+const IMPLEMENT_SCOPE_OPTIONS = [
+  { value: "all", label: "All variants" },
+  { value: "variant-1", label: "Variant 1" },
+  { value: "variant-2", label: "Variant 2" },
+  { value: "variant-3", label: "Variant 3" },
+  { value: "variant-4", label: "Variant 4" },
+] as const;
+
 function timeAgo(iso: string): string {
   try {
     const d = new Date(iso);
@@ -63,6 +73,10 @@ export default function DashboardPage() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [analyses, setAnalyses] = useState<VariantAnalysis[]>([]);
   const [structureLoading, setStructureLoading] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [implementScope, setImplementScope] = useState<string>("all");
+  const [implementLoading, setImplementLoading] = useState(false);
 
   const fetchDashboard = useCallback(async () => {
     const r = repo.trim();
@@ -135,12 +149,51 @@ export default function DashboardPage() {
     fetchStructure();
   }, [fetchStructure, data?.variants?.length]);
 
+  const sendImplement = useCallback(async () => {
+    const r = repo.trim();
+    const msg = chatInput.trim();
+    if (!r || !msg || implementLoading) return;
+    setChatMessages((prev) => [...prev, { role: "user", content: msg }]);
+    setChatInput("");
+    setImplementLoading(true);
+    try {
+      const res = await fetch("/api/dashboard-implement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repoFullName: r,
+          message: msg,
+          scope: implementScope || "all",
+        }),
+      });
+      const json = (await res.json()) as { ok?: boolean; message?: string; error?: string; pushed?: string[] };
+      if (res.ok && json.ok) {
+        const summary = json.message ?? (json.pushed?.length ? `Committed to ${json.pushed.join(", ")}.` : "Done.");
+        setChatMessages((prev) => [...prev, { role: "assistant", content: summary }]);
+      } else {
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: json.error ?? "Implement request failed." },
+        ]);
+      }
+    } catch (e) {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${e instanceof Error ? e.message : "Could not reach agent."}` },
+      ]);
+    } finally {
+      setImplementLoading(false);
+    }
+  }, [repo, chatInput, implementScope, implementLoading]);
+
   const hasRepo = !!repo.trim();
   const variants = data?.variants ?? [];
   const totalClicks = data?.totalClicks ?? 0;
   const topVariantId = data?.topVariantId ?? null;
   const events = data?.events ?? [];
   const maxClicks = Math.max(1, ...variants.map((v) => v.cta_clicks));
+  const totalSeconds = variants.reduce((acc, v) => acc + (v.total_seconds ?? 0), 0);
+  const formatTime = (sec: number) => (sec < 60 ? `${Math.round(sec)}s` : `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -172,7 +225,7 @@ export default function DashboardPage() {
             disabled={!hasRepo || loading}
             className="rounded bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-900 hover:bg-white disabled:opacity-50"
           >
-            {loading ? "Loading…" : COPY.DASHBOARD.REFRESH}
+            {COPY.DASHBOARD.REFRESH}
           </button>
           <label className="flex items-center gap-2 text-sm text-zinc-400">
             <input
@@ -216,6 +269,12 @@ export default function DashboardPage() {
             </p>
             <p className="mt-1 text-2xl font-semibold text-violet-200">{events.length}</p>
           </div>
+          <div className="rounded-lg border border-cyan-500/30 bg-cyan-950/20 px-4 py-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-cyan-400/90">
+              Total time (all variants)
+            </p>
+            <p className="mt-1 text-2xl font-semibold text-cyan-200">{totalSeconds > 0 ? formatTime(totalSeconds) : "—"}</p>
+          </div>
         </section>
 
         <div className="grid gap-6 lg:grid-cols-2">
@@ -235,6 +294,7 @@ export default function DashboardPage() {
                       </span>
                       <span className="text-zinc-500">
                         {v.cta_clicks} clicks · {v.share_percent}%
+                        {(v.total_seconds ?? 0) > 0 && ` · ${formatTime(v.total_seconds!)}`}
                       </span>
                     </div>
                     <div className="mt-1 h-2 overflow-hidden rounded-full bg-zinc-800">
@@ -275,6 +335,9 @@ export default function DashboardPage() {
                       {v.variant_id ?? `Variant ${i + 1}`}
                     </span>
                     <span className="text-sm text-zinc-400">{v.cta_clicks} clicks</span>
+                    {(v.total_seconds ?? 0) > 0 && (
+                      <span className="text-xs text-zinc-500">{formatTime(v.total_seconds!)}</span>
+                    )}
                     <div className="w-20 overflow-hidden rounded-full bg-zinc-700">
                       <div
                         className="h-2 rounded-full bg-emerald-500"
@@ -293,7 +356,7 @@ export default function DashboardPage() {
             </h2>
             <p className="mb-2 text-xs text-zinc-500">From your last Generate session (browser storage).</p>
             {structureLoading ? (
-              <p className="text-sm text-zinc-500">Analyzing variants…</p>
+              <p className="text-sm text-zinc-500"> </p>
             ) : analyses.length === 0 ? (
               <p className="text-sm text-zinc-500">{COPY.DASHBOARD.EMPTY_NO_VARIANTS}</p>
             ) : (
@@ -384,6 +447,68 @@ export default function DashboardPage() {
             )}
           </div>
         </div>
+
+        <section className="mt-8 rounded-xl border border-zinc-700 bg-zinc-900/50 p-4">
+          <h2 className="mb-3 text-sm font-semibold text-zinc-200">Implement something</h2>
+          <p className="mb-3 text-xs text-zinc-500">
+            Ask to change the repo (e.g. &quot;Add a testimonial section to variant 2&quot;). Requires repo above and a running sync agent.
+          </p>
+          <div className="max-h-64 space-y-2 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-800/50 p-3">
+            {chatMessages.length === 0 ? (
+              <p className="text-sm text-zinc-500">No messages yet. Enter an instruction and send.</p>
+            ) : (
+              chatMessages.map((m, i) => (
+                <div
+                  key={i}
+                  className={`rounded-lg px-3 py-2 text-sm ${
+                    m.role === "user"
+                      ? "ml-8 bg-zinc-700 text-zinc-100"
+                      : "mr-8 bg-zinc-700/70 text-zinc-300"
+                  }`}
+                >
+                  {m.content}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="mt-3 flex flex-wrap items-end gap-2">
+            <div className="min-w-0 flex-1">
+              <label className="mb-1 block text-xs text-zinc-500">Instruction</label>
+              <input
+                type="text"
+                placeholder="e.g. Add a testimonial section to variant 2"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendImplement()}
+                className="w-full rounded border border-zinc-600 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500"
+                disabled={implementLoading}
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-zinc-500">Apply to</label>
+              <select
+                value={implementScope}
+                onChange={(e) => setImplementScope(e.target.value)}
+                className="rounded border border-zinc-600 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500"
+                disabled={implementLoading}
+              >
+                {IMPLEMENT_SCOPE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <button
+              type="button"
+              onClick={sendImplement}
+              disabled={!hasRepo || !chatInput.trim() || implementLoading}
+              className="rounded bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-900 hover:bg-white disabled:opacity-50"
+            >
+              Send
+            </button>
+          </div>
+        </section>
       </main>
     </div>
   );

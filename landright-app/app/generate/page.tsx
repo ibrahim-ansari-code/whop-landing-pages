@@ -20,7 +20,7 @@ type VariantState = "loading" | "show" | "picked";
 /** Python backend URL. Generation is handled by Python only; no Next.js proxy. */
 const PYTHON_BACKEND_URL = GENERATE_API_BASE ?? "";
 const MISSING_BACKEND_MSG =
-  "Set NEXT_PUBLIC_GENERATE_API_URL to your Python backend (e.g. http://localhost:8000).";
+  "Set NEXT_PUBLIC_GENERATE_API_URL to your Python backend (e.g. http://localhost:8000). Run backend with venv: cd backend && .venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000.";
 
 export default function GeneratePage() {
   const router = useRouter();
@@ -40,7 +40,6 @@ export default function GeneratePage() {
   const [experienceLibrary, setExperienceLibrary] = useState<string[]>([]);
   const [refinementRound, setRefinementRound] = useState(1);
   const [similarityRound, setSimilarityRound] = useState(0);
-  const [loadingStepIndex, setLoadingStepIndex] = useState(0);
   const [validation, setValidation] = useState<{
     runnable: boolean;
     mobileFriendly: boolean;
@@ -66,6 +65,7 @@ export default function GeneratePage() {
   const [competitorDna, setCompetitorDna] = useState<Record<string, unknown> | null>(null);
   const [useCritic, setUseCritic] = useState(false);
   const initialFetchDone = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const fetchVariants = useCallback(
     async (opts?: {
@@ -88,15 +88,26 @@ export default function GeneratePage() {
       }
       setError(null);
       setState("loading");
+      abortControllerRef.current?.abort();
+      const ac = new AbortController();
+      abortControllerRef.current = ac;
       const isRefinement = !!opts?.chosenVariantTsx && opts.selectedVariantIndex != null;
       console.log("[Landright Generate] fetchVariants", { isRefinement, selectedVariantIndex: opts?.selectedVariantIndex });
       try {
         const url = `${PYTHON_BACKEND_URL}/generate`;
+        // Use competitorDna from state, or from sessionStorage on first load (state may not have updated yet)
+        let dna = competitorDna;
+        if (!dna && typeof window !== "undefined") {
+          try {
+            const stored = sessionStorage.getItem("landright-competitor-dna");
+            if (stored) dna = JSON.parse(stored) as Record<string, unknown>;
+          } catch { /* ignore */ }
+        }
         const body: Record<string, unknown> = {
           spec,
           promptId: DEFAULT_PROMPT_ID,
           useCritic,
-          ...(competitorDna ? { competitorDna } : {}),
+          ...(dna ? { competitorDna: dna } : {}),
           ...(isRefinement
             ? {
                 chosenVariantHtml: opts!.chosenVariantTsx,
@@ -112,6 +123,7 @@ export default function GeneratePage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
+          signal: ac.signal,
         });
         console.log("[Landright Generate] response", res.status, res.statusText);
         let data: { error?: string; message?: string; details?: string; detail?: string | { error?: string; details?: string }; variants?: unknown; experienceLibrary?: string[]; retry_after?: number };
@@ -176,9 +188,12 @@ export default function GeneratePage() {
         setSelectedIndex(null);
         initialFetchDone.current = true;
       } catch (e) {
+        if (e instanceof Error && e.name === "AbortError") {
+          return;
+        }
         let message = e instanceof Error ? e.message : "Something went wrong";
         if (message === "Failed to fetch" || /NetworkError|load failed/i.test(message)) {
-          message = `${message}. Make sure the backend is running (e.g. \`cd backend && python3 -m uvicorn main:app --port 8000\`) and NEXT_PUBLIC_GENERATE_API_URL is set (e.g. http://localhost:8000).`;
+          message = `${message}. Make sure the backend is running with the venv (e.g. \`cd backend && .venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000\`) and NEXT_PUBLIC_GENERATE_API_URL is set (e.g. http://localhost:8000).`;
         }
         console.error("[Landright Generate] fetch error", e);
         setError(message);
@@ -191,6 +206,13 @@ export default function GeneratePage() {
     },
     [spec, competitorDna, useCritic]
   );
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     const storedSpec = typeof window !== "undefined" ? sessionStorage.getItem(STORAGE_KEYS.SPEC) : null;
@@ -251,27 +273,6 @@ export default function GeneratePage() {
     }
   }, [spec, variants.length, state, regenerating, fetchVariants]);
 
-  // Rotate loading step message with varied timing (1.2s–3.2s) and occasional random jump for variety
-  useEffect(() => {
-    if (state !== "loading") return;
-    const steps = COPY.GENERATE.LOADING_STEPS;
-    if (!steps?.length) return;
-    let timeoutId: ReturnType<typeof setTimeout>;
-    const scheduleNext = () => {
-      const baseMs = 1200 + Math.random() * 2000;
-      timeoutId = setTimeout(() => {
-        setLoadingStepIndex((i) => {
-          const len = steps.length;
-          if (Math.random() < 0.25) return Math.floor(Math.random() * len);
-          return (i + 1) % len;
-        });
-        scheduleNext();
-      }, baseMs);
-    };
-    scheduleNext();
-    return () => clearTimeout(timeoutId);
-  }, [state]);
-
   // Validate current variant (runnable + mobile-friendly) when viewing changes
   useEffect(() => {
     const tsx = variants[viewingIndex] ?? "";
@@ -307,49 +308,20 @@ export default function GeneratePage() {
     };
   }, [viewingIndex, variants, spec]);
 
+  function startNewSession() {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setChosenFinalHtml(null);
+    setShowExport(false);
+    setShowAgentPanel(false);
+    setError(null);
+    router.push("/");
+  }
+
   function handlePick(index: number) {
     console.log("[Landright Generate] handlePick", index);
     setSelectedIndex(index);
     setState("picked");
-  }
-
-  const [deployPushing, setDeployPushing] = useState(false);
-  const [deployResult, setDeployResult] = useState<{ success: boolean; message: string } | null>(null);
-
-  async function handleDeployToAgent() {
-    if (selectedIndex == null || !variants[selectedIndex]) return;
-    if (!PYTHON_BACKEND_URL) {
-      setDeployResult({ success: false, message: "Set NEXT_PUBLIC_GENERATE_API_URL (e.g. http://localhost:8000) to deploy." });
-      return;
-    }
-    const tsx = variants[selectedIndex];
-    const reasoning = variantReasoning[selectedIndex] || "";
-    const drivers = conversionDrivers[selectedIndex] || [];
-    setDeployPushing(true);
-    setDeployResult(null);
-    try {
-      const res = await fetch(`${PYTHON_BACKEND_URL}/deploy`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tsx,
-          reasoning,
-          conversionDrivers: drivers,
-          companyName: spec?.websiteInformation?.name || "",
-          variantIndex: selectedIndex,
-        }),
-      });
-      if (res.ok) {
-        setDeployResult({ success: true, message: "Deployed to agent successfully" });
-      } else {
-        const text = await res.text().catch(() => "");
-        setDeployResult({ success: false, message: text || `Agent returned ${res.status}` });
-      }
-    } catch (e) {
-      setDeployResult({ success: false, message: e instanceof Error ? e.message : "Deploy failed" });
-    } finally {
-      setDeployPushing(false);
-    }
   }
 
   function handleSatisfied() {
@@ -552,8 +524,8 @@ export default function GeneratePage() {
       if (!res.ok) {
         const detailsStr = Array.isArray(data?.details) ? data.details.join("; ") : "";
         const msg =
-          res.status === 503 && typeof data?.error === "string" && data.error.toLowerCase().includes("sync_agent")
-            ? COPY.GENERATE.PUSH_ALL_AGENT_NOT_CONFIGURED
+          res.status === 503 && typeof data?.error === "string"
+            ? data.error
             : detailsStr || (typeof data?.error === "string" ? data.error : COPY.GENERATE.PUSH_ALL_ERROR);
         setSyncVariantsResult({ success: false, message: msg });
         return;
@@ -713,7 +685,8 @@ export default function GeneratePage() {
               <button
                 onClick={() => {
                   const repoName = (exportToGitHubRepoName || "").trim() || "landright-landing";
-                  const layer = (exportToGitHubLayer || "").trim() || "1";
+                  let layer = (exportToGitHubLayer || "").trim() || "1";
+                  if (layer.startsWith("layer-")) layer = layer.slice(6).trim() || layer;
                   if (typeof window === "undefined" || !GITHUB_CLIENT_ID) return;
                   try {
                     sessionStorage.setItem(STORAGE_KEYS.EXPORT_PENDING, JSON.stringify({ repoName, layer }));
@@ -806,12 +779,7 @@ export default function GeneratePage() {
             {COPY.GENERATE.GENERATE_AGAIN}
           </button>
           <button
-            onClick={() => {
-              setChosenFinalHtml(null);
-              setShowExport(false);
-              setShowAgentPanel(false);
-              router.push("/");
-            }}
+            onClick={startNewSession}
             className="ml-3 mt-4 rounded-lg border border-orange-500/50 px-4 py-2 text-sm text-white hover:bg-orange-500/20"
           >
             {COPY.GENERATE.NEW_SESSION}
@@ -844,7 +812,7 @@ export default function GeneratePage() {
               {COPY.DASHBOARD.HOME_LINK}
             </Link>
             <button
-              onClick={() => router.push("/")}
+              onClick={startNewSession}
               className="text-sm text-white/70 hover:text-orange-400 transition-colors"
             >
               {COPY.GENERATE.NEW_SESSION}
@@ -864,10 +832,7 @@ export default function GeneratePage() {
       {state === "loading" && (
         <div className="flex-1 flex flex-col h-[calc(100vh-3.5rem)] min-h-0 p-2">
           <div className="generating-glow flex-1 min-h-0 rounded-xl flex flex-col items-center justify-center gap-2 bg-black/50">
-            <p className="text-white font-medium transition-opacity duration-300">
-              {COPY.GENERATE.LOADING_STEPS[loadingStepIndex % COPY.GENERATE.LOADING_STEPS.length]}
-            </p>
-            <p className="text-sm text-white/70">{COPY.GENERATE.ESTIMATED_TIME}</p>
+            <p className="text-white font-medium">{COPY.GENERATE.LOADING}</p>
           </div>
         </div>
       )}
@@ -1027,31 +992,6 @@ export default function GeneratePage() {
             >
               {COPY.GENERATE.BACK_TO_VARIANTS}
             </button>
-          </div>
-          {/* Deploy to Agent: one clean POST with TSX + reasoning */}
-          <div className="mt-6 rounded-lg border border-emerald-500/30 bg-emerald-950/20 p-4 space-y-3">
-            <p className="text-sm font-medium text-emerald-200">Deploy selected variant</p>
-            <p className="text-xs text-emerald-300/60">One-click deploy: sends the selected TSX and reasoning to the agent.</p>
-            {variantReasoning[selectedIndex ?? 0] && (
-              <p className="text-xs text-zinc-400 italic">&quot;{variantReasoning[selectedIndex ?? 0]}&quot;</p>
-            )}
-            {conversionDrivers[selectedIndex ?? 0] && conversionDrivers[selectedIndex ?? 0].length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {conversionDrivers[selectedIndex ?? 0].map((d, i) => (
-                  <span key={i} className="text-[10px] bg-emerald-500/15 border border-emerald-500/20 rounded-full px-2 py-0.5 text-emerald-300">{d}</span>
-                ))}
-              </div>
-            )}
-            <button
-              onClick={handleDeployToAgent}
-              disabled={deployPushing}
-              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50 transition"
-            >
-              {deployPushing ? "Deploying…" : "Deploy to Agent"}
-            </button>
-            {deployResult && (
-              <p className={`text-xs ${deployResult.success ? "text-emerald-400" : "text-red-400"}`}>{deployResult.message}</p>
-            )}
           </div>
           {/* Push all 4 variants to GitHub via landrightgithubagent */}
           <div className="mt-8 rounded-lg border border-orange-500/20 bg-black/60 p-4 space-y-3">

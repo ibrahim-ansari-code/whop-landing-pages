@@ -30,5 +30,7 @@
   "Tier clarity: For multiple plans, one primary CTA (e.g. 'Start with Pro') with a short comparison nearby outperforms several equal-weight buttons.",
   "Whop and creator products: Emphasize community size, creator name, and what they get (access, course, circle); CTAs like 'Get access' or 'Join the community' outperform generic 'Sign up'.",
   "Membership and gated content: Lead with the benefit of joining (e.g. 'Join 1,200+ members') and use a single clear CTA; avoid stacking multiple sign-up buttons.",
-  "Creator-led landing pages: Pair the creator's face or name with the main CTA so the offer feels personal; 'Join [Creator]' or 'Get [Creator]'s course' aligns with how Whop and similar audiences decide."
+  "Creator-led landing pages: Pair the creator's face or name with the main CTA so the offer feels personal; 'Join [Creator]' or 'Get [Creator]'s course' aligns with how Whop and similar audiences decide.",
+  "Section visibility and engagement: Consider section visibility when comparing variants; hero and above-the-fold sections often drive more engagement and CTA clicks. Variants with stronger visibility on key sections (Hero, Features, Pricing) tend to convert better.",
+  "Visibility and CTA placement: Sections that get more view time (tracked via data-landright-section) are better candidates for primary CTAs; align CTA density with where users spend time."
 ]

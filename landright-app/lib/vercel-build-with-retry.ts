@@ -21,18 +21,102 @@ export interface BuildWithRetryResult {
   automaticFixesExhausted?: boolean;
 }
 
-/** Normalize variant TSX so it runs on Vercel: BOM strip, font names, "use client" at top */
+/** Strip markdown code fences so we never have ```tsx ... ``` in the file */
+function stripMarkdownFences(text: string): string {
+  let s = (text || "").trim();
+  if (!s.includes("```")) return s;
+  if (s.startsWith("```")) {
+    const first = s.indexOf("\n");
+    s = first >= 0 ? s.slice(first + 1) : "";
+    if (s.endsWith("```")) s = s.slice(0, s.lastIndexOf("```")).trim();
+  }
+  return s;
+}
+
+/** Replace curly/smart quotes and non-ASCII backticks with straight quotes / ASCII backtick */
+function normalizeCurlyQuotes(text: string): string {
+  return text
+    .replace(/\u2018/g, "'")
+    .replace(/\u2019/g, "'")
+    .replace(/\u201c/g, '"')
+    .replace(/\u201d/g, '"')
+    .replace(/\u201b/g, "'")
+    .replace(/\u02cb/g, "`");
+}
+
+const FONT_WHITELIST = new Set([
+  "Bebas_Neue", "Playfair_Display", "Oswald", "Anton", "Archivo_Black", "Barlow_Condensed",
+  "DM_Serif_Display", "Righteous", "Teko", "Ultra", "Abril_Fatface", "Alfa_Slab_One", "Fredoka_One",
+  "Manrope", "Source_Sans_3", "Nunito", "DM_Sans", "Outfit", "Sora", "Plus_Jakarta_Sans",
+  "Lexend", "Figtree", "Work_Sans", "Karla", "Lora", "Open_Sans", "Raleway", "Poppins",
+]);
+
+/** Replace any next/font/google font not in whitelist with Manrope */
+function normalizeFontNames(content: string): string {
+  const candidates = new Set<string>();
+  for (const m of content.matchAll(/\b([A-Z][A-Za-z0-9_]*)\s*\(\s*\{/g)) candidates.add(m[1]!);
+  const imp = content.match(/import\s+\{([^}]+)\}\s+from\s+['"]next\/font\/google['"]/);
+  if (imp) for (const n of imp[1].match(/\b[A-Za-z][A-Za-z0-9_]*/g) ?? []) candidates.add(n);
+  let s = content;
+  for (const name of candidates) if (!FONT_WHITELIST.has(name)) s = s.replace(new RegExp("\\b" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "g"), "Manrope");
+  return s;
+}
+
+/** If return ( has multiple root JSX elements, wrap in <> </> */
+function wrapMultipleRootsInFragment(content: string): string {
+  const idx = content.indexOf("return (");
+  if (idx < 0) return content;
+  let depth = 1;
+  let i = idx + "return (".length;
+  while (i < content.length && depth > 0) {
+    if (content[i] === "(") depth += 1;
+    else if (content[i] === ")") depth -= 1;
+    i += 1;
+  }
+  if (depth !== 0) return content;
+  const start = idx + "return (".length;
+  const closingParen = i - 1;
+  const between = content.slice(start, closingParen);
+  if (between.trimStart().startsWith("<>")) return content;
+  const lines = between.split("\n");
+  const rootIndents: number[] = [];
+  for (const line of lines) {
+    const stripped = line.trimStart();
+    if (stripped.startsWith("<") && stripped[1]?.match(/[a-zA-Z]/)) {
+      rootIndents.push(line.length - stripped.length);
+    }
+  }
+  if (rootIndents.length < 2) return content;
+  const minIndent = Math.min(...rootIndents);
+  const siblingCount = rootIndents.filter((ind) => ind === minIndent).length;
+  if (siblingCount < 2) return content;
+  return (
+    content.slice(0, start) +
+    "<>\n    " +
+    between +
+    "\n    </>" +
+    content.slice(closingParen)
+  );
+}
+
+/** Normalize variant TSX so it runs on Vercel: fences, quotes, BOM, font names, "use client" at top */
 function fixVariantTsx(content: string): string {
-  let s = (content || "").replace(/\ufeff/g, "").trim();
+  let s = stripMarkdownFences(content || "");
+  s = normalizeCurlyQuotes(s);
+  s = s.replace(/\ufeff/g, "").replace(/\u200b/g, "").replace(/\u200c/g, "").replace(/\u200d/g, "").trim();
   if (!s) return content || "";
   s = s.replace(/\bSource_Sans_Pro\b/g, "Source_Sans_3").replace(/\bNunito_Sans\b/g, "Nunito");
-  const lower = s.slice(0, 30).toLowerCase();
+  s = normalizeFontNames(s);
+  const lower = s.slice(0, 50).toLowerCase();
   if (lower.includes('"use client"') || lower.includes("'use client'")) {
     const first = s.indexOf("\n");
     const rest = first >= 0 ? s.slice(first + 1).trimStart() : "";
-    return '"use client";\n\n' + (rest ? rest + "\n" : "");
+    s = '"use client";\n\n' + (rest ? rest + "\n" : "");
+  } else {
+    s = '"use client";\n\n' + s;
   }
-  return '"use client";\n\n' + s;
+  s = wrapMultipleRootsInFragment(s);
+  return s;
 }
 
 /** Ensure Script import exists (for "Script is not defined" errors) */
@@ -68,7 +152,9 @@ function parseAffectedPaths(stderr: string): string[] {
 /** Apply all fixers to a variant file */
 function applyFixesToVariant(content: string, stderr: string): string {
   let s = fixVariantTsx(content);
-  if (/Script\s+is\s+not\s+defined|ReferenceError.*Script/i.test(stderr)) s = ensureScriptImport(s);
+  if (/<Script\s/.test(content) || /Script\s+is\s+not\s+defined|ReferenceError.*Script/i.test(stderr)) {
+    s = ensureScriptImport(s);
+  }
   return s;
 }
 

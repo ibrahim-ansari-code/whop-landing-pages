@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -73,6 +73,8 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 BACKEND_PUBLIC_URL = (os.environ.get("BACKEND_PUBLIC_URL") or "http://localhost:8000").strip().rstrip("/")
 BEACON_BASE_URL = (os.environ.get("BEACON_BASE_URL") or BACKEND_PUBLIC_URL).rstrip("/")
+POSTHOG_API_KEY = (os.environ.get("POSTHOG_API_KEY") or "").strip()
+POSTHOG_HOST = (os.environ.get("POSTHOG_HOST") or "https://us.i.posthog.com").strip().rstrip("/")
 # Allowed targetComponent values for partial refinement (Hero, CTA, Features only)
 TARGET_COMPONENT_ALLOWED = {"Hero", "CTA", "Features"}
 
@@ -80,6 +82,7 @@ TARGET_COMPONENT_ALLOWED = {"Hero", "CTA", "Features"}
 FONT_WHITELIST_DISPLAY = [
     "Bebas_Neue", "Playfair_Display", "Oswald", "Anton", "Archivo_Black", "Barlow_Condensed",
     "DM_Serif_Display", "Righteous", "Teko", "Ultra", "Abril_Fatface", "Alfa_Slab_One",
+    "Fredoka_One",
 ]
 FONT_WHITELIST_BODY = [
     "Manrope", "Source_Sans_3", "Nunito", "DM_Sans", "Outfit", "Sora", "Plus_Jakarta_Sans",
@@ -158,37 +161,65 @@ PROMPTS = _load_prompts()
 
 # --- Default (pre-built) experience library (paper: token prior from minimal ground-truth data) ---
 def _get_default_experience_library() -> list[str]:
-    """Load standard experience library from file; used when client sends empty experienceLibrary.
-    Supports JSON (array or {experienceLibrary: [...]}) and .md (bullet/dash list parsed by _experience_brief_to_list).
-    """
+    """Load standard experience library from file; merge with learned entries from Supabase (source=generation)."""
     path_str = os.environ.get("EXPERIENCE_LIBRARY_PATH", "").strip()
     path = Path(path_str).resolve() if path_str else APP_DIR / "experience_library_default.json"
-    if not path.exists():
-        # Optional: try same base name with .md (e.g. experience_library_default.md)
-        if path_str or (APP_DIR / "experience_library_default.md").exists():
-            md_path = (path.parent / (path.stem + ".md")) if path_str else APP_DIR / "experience_library_default.md"
-            if md_path.exists():
-                try:
-                    text = md_path.read_text(encoding="utf-8")
-                    return _experience_brief_to_list(text)
-                except OSError:
-                    pass
+    out: list[str] = []
+    if path.exists():
+        try:
+            suffix = path.suffix.lower()
+            if suffix == ".md":
+                text = path.read_text(encoding="utf-8")
+                out = _experience_brief_to_list(text)
+            else:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    out = [str(x).strip() for x in data if x and str(x).strip()]
+                elif isinstance(data, dict) and "experienceLibrary" in data:
+                    raw = data["experienceLibrary"]
+                    if isinstance(raw, list):
+                        out = [str(x).strip() for x in raw if x and str(x).strip()]
+        except (json.JSONDecodeError, TypeError, OSError):
+            pass
+    if not out and (path_str or (APP_DIR / "experience_library_default.md").exists()):
+        md_path = (path.parent / (path.stem + ".md")) if path_str else APP_DIR / "experience_library_default.md"
+        if md_path.exists():
+            try:
+                out = _experience_brief_to_list(md_path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+    learned = _fetch_learned_experience_entries()
+    if learned:
+        out = out + learned
+    return out
+
+
+def _fetch_learned_experience_entries(limit: int = 50) -> list[str]:
+    """Fetch learned generation lessons from Supabase experience_library_entries (source=generation)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return []
     try:
-        suffix = path.suffix.lower()
-        if suffix == ".md":
-            text = path.read_text(encoding="utf-8")
-            return _experience_brief_to_list(text)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [str(x).strip() for x in data if x and str(x).strip()]
-        if isinstance(data, dict) and "experienceLibrary" in data:
-            raw = data["experienceLibrary"]
-            if isinstance(raw, list):
-                return [str(x).strip() for x in raw if x and str(x).strip()]
-    except (json.JSONDecodeError, TypeError, OSError):
-        pass
-    return []
+        url = f"{SUPABASE_URL}/rest/v1/experience_library_entries"
+        params = {"source": "eq.generation", "order": "created_at.desc", "limit": str(limit), "select": "entry"}
+        with httpx.Client() as client:
+            r = client.get(
+                url,
+                params=params,
+                headers={
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Accept": "application/json",
+                },
+                timeout=5.0,
+            )
+        if r.status_code >= 400:
+            return []
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        return [str(row.get("entry", "")).strip() for row in data if row.get("entry")]
+    except Exception:
+        return []
 
 
 def _get_prompt_system_text(prompt_id: str) -> str:
@@ -258,7 +289,15 @@ class BeaconBody(BaseModel):
     layer: str | None = None
     cta_label: str | None = None
     cta_id: str | None = None
+    event_source: str | None = None  # 'real' (default) | 'simulated' | 'simgym' for SimGym-style traffic
 
+class BeaconTimeBody(BaseModel):
+    repo_full_name: str
+    layer: str
+    variant_id: str
+    event_source: str | None = None  # 'real' (default) | 'simulated' | 'simgym'
+    duration_seconds: float
+    section_id: str | None = None
 
 class BuildExportBundleBody(BaseModel):
     variant_tsx_list: list[str]
@@ -408,7 +447,7 @@ def get_refinement_system_prompt(diversity_instruction: str = "", target_compone
 
 Use the design skill above. The brief will drive 4 landing page variants.{diversity_block}{component_block}
 
-Brief must include: (1) Business: name, one sentence, tagline, CTA label from spec. (2) For each of the 4 variants, assign one aesthetic direction (e.g. dark cinematic, light minimal, bold editorial, refined typography) consistent with the diversity instruction. (3) Per variant: colors (hex), display + body fonts from the allowed list only ({FONT_WHITELIST_PROMPT}), layout hint, one signature visual. (4) Copy: headline, subhead, 3 feature bullets—real copy only, no Lorem. (5) Only the spec CTAs and footer links may be clickable; no links to /features, /pricing, /about or other non-existent pages."""
+Brief must include: (1) Business: name, one sentence, tagline, CTA label from spec. (2) For each of the 4 variants, assign one aesthetic direction (e.g. dark cinematic, light minimal, bold editorial, refined typography) consistent with the diversity instruction. (2b) For each of the 4 variants, assign one CTA structure (placement and count only; labels/URLs come from spec). For example: Variant 1 = single hero CTA only; Variant 2 = hero + footer; Variant 3 = hero + one mid-section CTA + footer; Variant 4 = sticky/fixed CTA bar + hero. Each variant MUST have a different CTA structure (different placement and/or count); do not repeat the same structure across all four. (3) Per variant: colors (hex), display + body fonts from the allowed list only ({FONT_WHITELIST_PROMPT}), layout hint, one signature visual. (4) Copy: headline, subhead, 3 feature bullets—real copy only, no Lorem. (5) Only the spec CTAs and footer links may be clickable; no links to /features, /pricing, /about or other non-existent pages."""
 
 
 def _get_single_variant_system_prompt_uncached(prompt_id: str, variant_index: int, diversity_instruction: str = "", target_component: str | None = None) -> str:
@@ -421,9 +460,9 @@ def _get_single_variant_system_prompt_uncached(prompt_id: str, variant_index: in
 
 Variant {variant_index} of {VARIANT_COUNT}. Use the aesthetic and specs for variant {variant_index} from the brief.{diversity_block}{component_block}
 
-All CTA buttons and links must use the exact labels and URLs provided in the user message (from the spec). Do not use href=\"#\" or placeholder URLs for those CTAs. Only include as clickable links/buttons the CTAs and footer links listed in the user message—do not add navigation links to routes like /features, /pricing, /about (those pages do not exist).
+Follow the brief's CTA structure for this variant only (where and how many CTAs); use the spec's CTA labels and URLs. Do not copy another variant's CTA layout. All CTA buttons and links must use the exact labels and URLs provided in the user message (from the spec). Do not use href=\"#\" or placeholder URLs for those CTAs. Only include as clickable links/buttons the CTAs and footer links listed in the user message—do not add navigation links to routes like /features, /pricing, /about (those pages do not exist).
 
-Output: single JSON only: {{ "tsx": "<full TSX string>" }}. No markdown, no preamble. Full page: nav (logo+links+CTA), hero (headline+sub+CTA(s)), ≥2 sections, footer. next/font/google + Tailwind. {FONT_WHITELIST_PROMPT} Real copy from brief; no Lorem. Code must run in any browser: use only browser-safe APIs, no Node/server-only. Must be responsive: use Tailwind sm:/md:/lg: for layout and type so it works on mobile and desktop. Valid React/JSX only.
+Output: single JSON only: {{ "tsx": "<full TSX string>" }}. No markdown, no preamble. Full page: nav (logo+links+CTA), hero (headline+sub+CTA(s)), ≥2 sections, footer. next/font/google + Tailwind. {FONT_WHITELIST_PROMPT} Real copy from brief; no Lorem. Code must run in any browser: use only browser-safe APIs, no Node/server-only. Must be responsive: use Tailwind sm:/md:/lg: for layout and type so it works on mobile and desktop. Valid React/JSX only. Wrap each major section (nav, hero, features, testimonials, pricing, FAQ, footer) in a section or div with data-landright-section=\"SectionName\" (e.g. data-landright-section=\"Hero\") so visibility can be tracked.
 
 If the user message says a logo image is provided, use an <img> element in the nav with src="__LOGO_URL__" (exactly that placeholder), alt set to the company name, and appropriate sizing classes (e.g. h-8 w-auto). Place it where the company name/logo text would normally go. You may keep the company name as text next to the image or hide it—choose what looks best for the design."""
 
@@ -462,28 +501,43 @@ def _get_single_variant_system_blocks(
 def _build_inspiration_directive(dna: dict | None) -> dict | None:
     """Compress inspiration data into a compact, tiered JSON directive for the LLM.
 
+    Supports both the current flat schema (palette, button_style, hero_layout, etc. at top level)
+    and the legacy nested schema (design_system.color.palette, hero.layout, etc.) for backward compat.
+
     Returns a small dict with two tiers:
       - APPLY: design tokens to directly use (palette, shadows, radii, buttons, typography)
-      - FOLLOW: structural patterns to emulate (layout, sections, persuasion)
+      - FOLLOW: structural patterns to emulate (layout, section order, social proof, tone)
     Returns None if no inspiration data.
     """
     if not dna:
         return None
 
-    apply_tier: dict = {}  # direct design tokens
-    follow_tier: dict = {}  # structural patterns
+    apply_tier: dict = {}
+    follow_tier: dict = {}
 
-    # Tier 1 — APPLY: theme_overrides are direct design tokens
+    # --- APPLY tier: direct design tokens ---
+    # Flat schema (current): fields are at the top level
+    for key in ("palette", "accent", "headline_style", "body_style",
+                "button_style", "card_style", "border_radius", "shadow_depths",
+                "gradients", "animation_style", "hover_effects"):
+        val = dna.get(key)
+        if val and str(val).strip().lower() not in ("none", ""):
+            apply_tier[key] = val
+    if dna.get("glassmorphism"):
+        apply_tier["glassmorphism"] = True
+
+    # Legacy fallback: nested design_system / theme_overrides
     to = dna.get("theme_overrides", {})
     if isinstance(to, dict):
-        for key in ("palette", "accent", "shadow_depths", "border_radius", "gradients",
-                     "animation_style", "hover_effects", "button_style", "card_style",
-                     "headline_style", "body_style"):
-            val = to.get(key)
-            if val and val != "none":
-                apply_tier[key] = val
+        for key in ("shadow_depths", "border_radius", "gradients", "animation_style",
+                    "hover_effects", "button_style", "card_style"):
+            if not apply_tier.get(key):
+                val = to.get(key)
+                if val and str(val).strip().lower() not in ("none", ""):
+                    apply_tier[key] = val
+        if to.get("glassmorphism") and not apply_tier.get("glassmorphism"):
+            apply_tier["glassmorphism"] = True
 
-    # Fill from design_system if theme_overrides didn't have them
     ds = dna.get("design_system", {})
     if isinstance(ds, dict):
         color = ds.get("color", {}) if isinstance(ds.get("color"), dict) else {}
@@ -501,37 +555,45 @@ def _build_inspiration_directive(dna: dict | None) -> dict | None:
             apply_tier["button_style"] = comps["buttons"]
         if not apply_tier.get("card_style") and comps.get("cards"):
             apply_tier["card_style"] = comps["cards"]
-        if ds.get("layout"):
+        if ds.get("layout") and not follow_tier.get("layout"):
             follow_tier["layout"] = ds["layout"]
 
-    # Tier 2 — FOLLOW: structural patterns
-    hero = dna.get("hero", {})
-    if isinstance(hero, dict) and hero.get("layout"):
-        follow_tier["hero"] = hero["layout"]
-        if hero.get("visual_type"):
-            follow_tier["hero_visual"] = hero["visual_type"]
+    # --- FOLLOW tier: structural patterns ---
+    # Flat schema
+    if dna.get("hero_layout"):
+        follow_tier["hero"] = dna["hero_layout"]
+    if dna.get("section_order") and isinstance(dna["section_order"], list):
+        follow_tier["sections"] = [str(s) for s in dna["section_order"][:10] if s]
+    if dna.get("social_proof_type") and dna["social_proof_type"] != "none":
+        follow_tier["social_proof"] = dna["social_proof_type"]
+    if dna.get("tone"):
+        follow_tier["tone"] = dna["tone"]
+    if dna.get("persuasion_triggers") and isinstance(dna["persuasion_triggers"], list):
+        follow_tier["triggers"] = [str(t) for t in dna["persuasion_triggers"][:6] if t]
 
-    sp = dna.get("social_proof", {})
-    if isinstance(sp, dict) and sp.get("type"):
-        follow_tier["social_proof"] = sp["type"]
-
-    sections = dna.get("sections", [])
-    if isinstance(sections, list) and sections:
-        follow_tier["sections"] = [
-            s.get("content_type", s.get("id", "unknown"))
-            for s in sections[:10] if isinstance(s, dict)
-        ]
-
-    diction = dna.get("diction", {})
-    if isinstance(diction, dict):
-        if diction.get("tone"):
-            follow_tier["tone"] = diction["tone"]
-        if diction.get("triggers"):
-            follow_tier["triggers"] = diction["triggers"][:6]
-
-    nav = dna.get("nav", {})
-    if isinstance(nav, dict) and nav.get("style"):
-        follow_tier["nav_style"] = nav["style"]
+    # Legacy fallback: nested hero / social_proof / sections / diction
+    if not follow_tier.get("hero"):
+        hero = dna.get("hero", {})
+        if isinstance(hero, dict) and hero.get("layout"):
+            follow_tier["hero"] = hero["layout"]
+    if not follow_tier.get("social_proof"):
+        sp = dna.get("social_proof", {})
+        if isinstance(sp, dict) and sp.get("type"):
+            follow_tier["social_proof"] = sp["type"]
+    if not follow_tier.get("sections"):
+        sections = dna.get("sections", [])
+        if isinstance(sections, list) and sections:
+            follow_tier["sections"] = [
+                s.get("content_type", s.get("id", "unknown"))
+                for s in sections[:10] if isinstance(s, dict)
+            ]
+    if not follow_tier.get("tone") or not follow_tier.get("triggers"):
+        diction = dna.get("diction", {})
+        if isinstance(diction, dict):
+            if not follow_tier.get("tone") and diction.get("tone"):
+                follow_tier["tone"] = diction["tone"]
+            if not follow_tier.get("triggers") and diction.get("triggers"):
+                follow_tier["triggers"] = [str(t) for t in diction["triggers"][:6] if t]
 
     if not apply_tier and not follow_tier:
         return None
@@ -1083,7 +1145,7 @@ def _get_diversity_instruction(
         mode_sentence = "This is an established direction (later round): favor micro-refinements; keep strong elements stable and vary only where it clearly improves conversion."
     else:
         variation_mode = "Bold Variation"
-        mode_sentence = "This is a new project / early round: favor bold variation across the four variants; explore distinct aesthetics and layouts."
+        mode_sentence = "This is a new project / early round: favor bold variation across the four variants; explore distinct aesthetics, layouts, and CTA placement/count (e.g. single hero CTA vs hero+footer vs multiple sections)."
     cfg = _practice_config()
     preamble = (cfg.get("diversity_system_preamble") or "Output 1-3 sentences on how much to align vs vary across four variants, given experiences and round.").strip()
     tpl = (cfg.get("diversity_user_template") or "Experiences:\n{{experiences}}\n\nRound: {{round}}\n\nSpec: {{spec}}\n\nOutput the diversity instruction.").strip()
@@ -1136,7 +1198,7 @@ def _get_similar_variant_system_blocks(
         "type": "text",
         "text": f"""Follow the design skill above. {instruction}{round_note}{token_prior_note}{diversity_block}
 
-Output: single JSON only: {{ "tsx": "<full TSX string>" }}. No markdown, no preamble. Full page: nav, hero, ≥2 sections, footer. next/font/google + Tailwind. {FONT_WHITELIST_PROMPT} Browser-only, responsive (Tailwind sm:/md:/lg:), valid React/JSX. Only use as clickable links/buttons the CTAs and footer links from the user message—do not add links to /features, /pricing, /about or other non-existent routes.""",
+Output: single JSON only: {{ "tsx": "<full TSX string>" }}. No markdown, no preamble. Full page: nav, hero, ≥2 sections, footer. next/font/google + Tailwind. {FONT_WHITELIST_PROMPT} Browser-only, responsive (Tailwind sm:/md:/lg:), valid React/JSX. Only use as clickable links/buttons the CTAs and footer links from the user message—do not add links to /features, /pricing, /about or other non-existent routes. Wrap each major section (nav, hero, features, testimonials, pricing, FAQ, footer) in a section or div with data-landright-section=\"SectionName\" (e.g. data-landright-section=\"Hero\") so visibility can be tracked.""",
     })
     return blocks
 
@@ -1545,10 +1607,10 @@ app = FastAPI(title="Landright Generate API", version="0.1.0")
 
 
 class BeaconCORSMiddleware(BaseHTTPMiddleware):
-    """Allow any origin for POST /beacon so customer-deployed sites can send CTA clicks to our backend."""
+    """Allow any origin for POST /beacon and POST /beacon-time so customer-deployed sites can send events to our backend."""
 
     async def dispatch(self, request, call_next):
-        if request.url.path != "/beacon":
+        if request.url.path not in ("/beacon", "/beacon-time"):
             return await call_next(request)
         origin = request.headers.get("origin", "").strip() or "*"
         if request.method == "OPTIONS":
@@ -1578,7 +1640,7 @@ app.add_middleware(BeaconCORSMiddleware)  # outermost: allow any origin for /bea
 
 # --- Critic Agent (Shadow-Mode Internal Audit) --------------------------------
 CRITIC_THRESHOLD = float(os.environ.get("CRITIC_THRESHOLD", "0.85"))
-CRITIC_MAX_RETRIES = int(os.environ.get("CRITIC_MAX_RETRIES", "2"))
+CRITIC_MAX_RETRIES = int(os.environ.get("CRITIC_MAX_RETRIES", "3"))
 
 def _build_critic_system_prompt(inspiration_triggers: list[str] | None = None) -> str:
     """Build critic system prompt, optionally incorporating persuasion triggers as hard constraints."""
@@ -1654,12 +1716,21 @@ def _critic_score_variant(
 
 
 def _extract_inspiration_triggers(competitor_dna: dict | None) -> list[str]:
-    """Pull persuasion triggers from inspiration data to use as critic constraints."""
+    """Pull persuasion triggers from inspiration data to use as critic constraints.
+    Supports both flat schema (persuasion_triggers at top level) and legacy nested (diction.triggers)."""
     if not competitor_dna:
         return []
+    # Flat schema (current)
+    flat = competitor_dna.get("persuasion_triggers")
+    if isinstance(flat, list) and flat:
+        return [str(t) for t in flat[:10] if t]
+    # Legacy nested schema
     diction = competitor_dna.get("diction", {})
-    triggers = diction.get("triggers", []) if isinstance(diction, dict) else []
-    return [str(t) for t in triggers[:10]] if isinstance(triggers, list) else []
+    if isinstance(diction, dict):
+        nested = diction.get("triggers", [])
+        if isinstance(nested, list) and nested:
+            return [str(t) for t in nested[:10] if t]
+    return []
 
 
 def _run_critic_audit(
@@ -1718,91 +1789,35 @@ def _run_critic_audit(
 
 
 # --- DesignSpecPipeline: extractDesignSpec ------------------------------------
-_EXTRACT_SYSTEM_PROMPT = """You are an expert landing page design analyst. Given the HTML content (or screenshot) of a website, extract a comprehensive, structured design specification.
+_EXTRACT_SYSTEM_PROMPT = """You are a landing page design analyst. Given a screenshot, extract design DNA as a flat JSON.
 
-Output ONLY a valid JSON object with this schema (no markdown, no commentary):
+Output ONLY a valid JSON object (no markdown fences, no explanation):
 {
-  "brand": {
-    "name": "string",
-    "tagline": "string",
-    "value_prop": "string"
-  },
-  "hero": {
-    "layout": "two_column | centered | split | asymmetric",
-    "headline": "string",
-    "subheadline": "string",
-    "primary_cta": "string",
-    "trust_note": "string or null",
-    "visual_type": "product_mockup | illustration | video | gradient | none",
-    "visual_elements": ["string"]
-  },
-  "nav": {
-    "position": "top_fixed | top_static | sidebar",
-    "items": ["string"],
-    "style": "string"
-  },
-  "social_proof": {
-    "headline": "string or null",
-    "type": "logo_strip | testimonials | stats | combined",
-    "elements": ["string"]
-  },
-  "sections": [
-    {
-      "id": "string",
-      "title": "string",
-      "content_type": "features | steps | benefits | testimonials | pricing | security | integrations | faq | cta_banner",
-      "elements": ["string"],
-      "highlights": ["string"]
-    }
-  ],
-  "design_system": {
-    "layout": "string describing overall layout approach",
-    "typography": {
-      "headline_style": "string",
-      "body_style": "string",
-      "alignment": "left | center | mixed"
-    },
-    "color": {
-      "background": "string",
-      "text": "string",
-      "accent": "string",
-      "palette": ["#hex1", "#hex2", ...]
-    },
-    "components": {
-      "buttons": "string describing button style",
-      "cards": "string describing card style",
-      "other": ["string"]
-    }
-  },
-  "footer": {
-    "cta_banner": { "headline": "string or null", "primary_cta": "string or null" },
-    "columns": ["string"],
-    "extras": ["string"]
-  },
-  "diction": {
-    "tone": "string",
-    "triggers": ["string"]
-  },
-  "theme_overrides": {
-    "shadow_depths": "string describing shadow usage (e.g. 'subtle soft shadows on cards, heavy drop-shadow on hero CTA')",
-    "border_radius": "string describing border-radius patterns (e.g. 'rounded-2xl cards, pill buttons, sharp nav')",
-    "animation_style": "string describing animation/motion patterns (e.g. 'fade-in on scroll, hover scale on cards, gradient shift on buttons')",
-    "transition_timing": "string (e.g. 'ease-out 300ms', 'spring-like 200ms')",
-    "hover_effects": "string describing hover behaviors (e.g. 'cards lift with shadow, buttons darken, links underline')",
-    "glassmorphism": "boolean - true if frosted glass effects are used",
-    "gradients": "string describing gradient usage or 'none'"
-  }
+  "palette": ["#hex", "#hex", "#hex", "#hex"],
+  "accent": "#hex",
+  "headline_style": "describe headline typography (e.g. 'large bold white sans-serif', 'thin italic serif')",
+  "body_style": "describe body text (e.g. 'medium-weight clean sans-serif, left-aligned')",
+  "button_style": "describe CTA buttons (e.g. 'pill-shaped gradient fill with drop shadow', 'outlined sharp corners uppercase')",
+  "card_style": "describe feature/content blocks (e.g. 'glassmorphic rounded-2xl dark border', 'flat minimal with colored icon')",
+  "border_radius": "describe radius patterns across page (e.g. 'rounded-2xl cards, pill buttons, sharp nav links')",
+  "shadow_depths": "describe shadow usage (e.g. 'subtle card shadows, heavy drop-shadow on hero CTA, no nav shadow')",
+  "gradients": "describe gradient usage (e.g. 'purple-to-blue full-page bg, orange hover on CTAs') or 'none'",
+  "animation_style": "describe motion (e.g. 'fade-in-up on scroll, hover scale on feature cards') or 'none'",
+  "hover_effects": "describe hover states (e.g. 'cards lift 4px + shadow, buttons darken 10%, nav links underline')",
+  "glassmorphism": false,
+  "hero_layout": "two_column | centered | split | asymmetric",
+  "section_order": ["features", "testimonials", "pricing"],
+  "social_proof_type": "logo_strip | testimonials | stats | combined | none",
+  "tone": "describe brand voice (e.g. 'professional and authoritative', 'casual energetic startup')",
+  "persuasion_triggers": ["specific technique", "specific technique"]
 }
 
 Rules:
-- Extract EVERY section visible on the page in order.
-- palette: 4-8 dominant hex colors.
-- sections[].elements: list specific UI components and content used (cards, grids, icons, images, badges, etc.).
-- sections[].highlights: key copy points or feature names listed.
-- diction.triggers: specific persuasion techniques (social proof, urgency, authority, trust badges, risk reversal, scarcity, etc.).
-- theme_overrides: Identify SIGNATURE AESTHETICS — the distinctive visual details that give the site its character. Look at shadow depths/styles, border-radius patterns across components, animation types and timing, hover effects, gradient usage, and any glassmorphism.
-- Be thorough: capture design patterns, visual elements, component styles, and content structure.
-- Output ONLY the JSON object. No preamble, no explanation."""
+- palette: 4–8 dominant hex colors. Look carefully at backgrounds, headings, and CTAs.
+- section_order: list content sections IN ORDER, excluding hero/nav/footer. Use only: features, steps, benefits, testimonials, pricing, security, integrations, faq, cta_banner.
+- persuasion_triggers: specific techniques visible (e.g. "social proof logos", "money-back guarantee badge", "urgency countdown", "authority statistics", "trust seals", "risk reversal").
+- glassmorphism: true only if frosted-glass effects (backdrop-blur) are visible.
+- Output ONLY the JSON object. No preamble."""
 
 # Playwright: optional for JS-rendered fetch (install with: pip install playwright && playwright install chromium)
 _playwright_sync: object = None
@@ -1965,9 +1980,9 @@ def _fetch_page_content(url: str) -> str:
 
 
 def _extract_design_spec_from_html(api_key: str, content: str, url: str) -> dict:
-    """Use Claude to extract the rich inspiration spec from sanitized page content."""
-    user_msg = f"Analyze this landing page and extract the full design specification.\n\nURL: {url}\n\nExtracted page content (headings, text, buttons, links, layout signals):\n{content}"
-    raw = call_claude(api_key, _EXTRACT_SYSTEM_PROMPT, user_msg, max_tokens_override=4096)
+    """Use Claude to extract flat design DNA from sanitized page content."""
+    user_msg = f"Extract the design DNA from this landing page as flat JSON.\n\nURL: {url}\n\nPage content signals (headings, text, buttons, links, layout hints):\n{content}"
+    raw = call_claude(api_key, _EXTRACT_SYSTEM_PROMPT, user_msg, max_tokens_override=1024)
     return _parse_extracted_spec(raw)
 
 
@@ -1992,7 +2007,7 @@ def _extract_design_spec_from_screenshot(api_key: str, image_data: str, url: str
                 },
                 {
                     "type": "text",
-                    "text": f"Analyze this competitor landing page screenshot and extract the design specification.\n\nURL: {url}",
+                    "text": f"Extract the design DNA from this landing page screenshot as flat JSON.\n\nURL: {url}",
                 },
             ],
         }
@@ -2005,8 +2020,8 @@ def _extract_design_spec_from_screenshot(api_key: str, image_data: str, url: str
     }
     payload = {
         "model": model,
-        "max_tokens": 4096,
-        "temperature": 0.2,
+        "max_tokens": 1024,
+        "temperature": 0.1,
         "system": _EXTRACT_SYSTEM_PROMPT,
         "messages": messages,
     }
@@ -2040,32 +2055,53 @@ def _parse_extracted_spec(raw: str) -> dict:
 
 
 def _merge_inspiration_results(results: list[dict]) -> dict:
-    """Merge multiple inspiration extractions into a single combined spec."""
+    """Merge multiple inspiration extractions into a single combined spec.
+    Handles both flat schema (current) and legacy nested schema.
+    For single results, returns as-is (fast path).
+    """
     if not results:
         return {}
     if len(results) == 1:
         return results[0]
-    merged: dict = {}
-    for key in ("brand", "hero", "nav", "social_proof", "footer", "diction"):
-        for r in results:
-            if key in r and r[key]:
-                if key not in merged:
+    # Multiple results: pick first non-empty value for each flat field, merge palettes/sections
+    merged: dict = results[0].copy()
+    flat_scalar_keys = ("accent", "headline_style", "body_style", "button_style", "card_style",
+                        "border_radius", "shadow_depths", "gradients", "animation_style",
+                        "hover_effects", "glassmorphism", "hero_layout", "social_proof_type", "tone")
+    for key in flat_scalar_keys:
+        if not merged.get(key):
+            for r in results[1:]:
+                if r.get(key):
                     merged[key] = r[key]
-    all_sections: list[dict] = []
+                    break
+    # Merge palettes (deduplicate)
+    all_palettes: list[str] = []
     for r in results:
-        for s in r.get("sections", []):
-            all_sections.append(s)
+        for c in (r.get("palette") or []):
+            if isinstance(c, str) and c not in all_palettes:
+                all_palettes.append(c)
+    if all_palettes:
+        merged["palette"] = all_palettes[:8]
+    # Merge section_order (deduplicate, preserve order)
+    all_sections: list[str] = []
+    seen_sections: set[str] = set()
+    for r in results:
+        for s in (r.get("section_order") or []):
+            if isinstance(s, str) and s not in seen_sections:
+                all_sections.append(s)
+                seen_sections.add(s)
     if all_sections:
-        merged["sections"] = all_sections
-    ds_list = [r.get("design_system", {}) for r in results if r.get("design_system")]
-    if ds_list:
-        merged_ds = ds_list[0].copy()
-        all_palettes: list[str] = []
-        for ds in ds_list:
-            all_palettes.extend(ds.get("color", {}).get("palette", []))
-        if all_palettes and "color" in merged_ds:
-            merged_ds["color"]["palette"] = list(dict.fromkeys(all_palettes))[:12]
-        merged["design_system"] = merged_ds
+        merged["section_order"] = all_sections[:12]
+    # Merge persuasion_triggers (deduplicate)
+    all_triggers: list[str] = []
+    seen_t: set[str] = set()
+    for r in results:
+        for t in (r.get("persuasion_triggers") or []):
+            if isinstance(t, str) and t.lower() not in seen_t:
+                all_triggers.append(t)
+                seen_t.add(t.lower())
+    if all_triggers:
+        merged["persuasion_triggers"] = all_triggers[:8]
     return merged
 
 
@@ -2110,77 +2146,124 @@ def extract_design_spec(body: ExtractDesignSpecBody):
     merged = _merge_inspiration_results(results)
     log.info("extract_inspiration: done, %d sources, %d errors", len(results), len(errors))
 
-    # Ghost Processing: auto-map Signature Aesthetics + Design System into theme_overrides
+    # --- Build themeOverrides for the frontend UI (palette swatches, tags, etc.) ---
+    # Supports both flat schema (palette at top-level) and legacy nested schema.
     ghost_theme: dict = {}
-    ds = merged.get("design_system", {})
+    for key in ("palette", "accent", "headline_style", "body_style", "button_style",
+                "card_style", "border_radius", "shadow_depths", "gradients",
+                "animation_style", "hover_effects"):
+        val = merged.get(key)
+        if val:
+            ghost_theme[key] = val
+    if merged.get("glassmorphism"):
+        ghost_theme["glassmorphism"] = True
+    # Legacy fallback: theme_overrides / design_system (backward compat)
     to = merged.get("theme_overrides", {})
-    if ds or to:
-        ghost_theme = {**(to if isinstance(to, dict) else {})}
-        if isinstance(ds, dict):
-            color = ds.get("color", {})
-            if isinstance(color, dict) and color.get("palette"):
+    if isinstance(to, dict):
+        for key in ("shadow_depths", "border_radius", "gradients", "animation_style",
+                    "hover_effects", "button_style", "card_style"):
+            if not ghost_theme.get(key) and to.get(key):
+                ghost_theme[key] = to[key]
+    ds = merged.get("design_system", {})
+    if isinstance(ds, dict):
+        color = ds.get("color", {})
+        if isinstance(color, dict):
+            if not ghost_theme.get("palette") and color.get("palette"):
                 ghost_theme["palette"] = color["palette"]
-            if isinstance(color, dict) and color.get("accent"):
+            if not ghost_theme.get("accent") and color.get("accent"):
                 ghost_theme["accent"] = color["accent"]
-            typo = ds.get("typography", {})
-            if isinstance(typo, dict):
-                if typo.get("headline_style"):
-                    ghost_theme["headline_style"] = typo["headline_style"]
-                if typo.get("body_style"):
-                    ghost_theme["body_style"] = typo["body_style"]
-            comps = ds.get("components", {})
-            if isinstance(comps, dict):
-                if comps.get("buttons"):
-                    ghost_theme["button_style"] = comps["buttons"]
-                if comps.get("cards"):
-                    ghost_theme["card_style"] = comps["cards"]
-            if ds.get("layout"):
-                ghost_theme["layout"] = ds["layout"]
+        typo = ds.get("typography", {})
+        if isinstance(typo, dict):
+            if not ghost_theme.get("headline_style") and typo.get("headline_style"):
+                ghost_theme["headline_style"] = typo["headline_style"]
+            if not ghost_theme.get("body_style") and typo.get("body_style"):
+                ghost_theme["body_style"] = typo["body_style"]
+        comps = ds.get("components", {})
+        if isinstance(comps, dict):
+            if not ghost_theme.get("button_style") and comps.get("buttons"):
+                ghost_theme["button_style"] = comps["buttons"]
+            if not ghost_theme.get("card_style") and comps.get("cards"):
+                ghost_theme["card_style"] = comps["cards"]
 
-    # Derive top-3 conversion drivers from the scan
+    # --- Build sections/diction shape that the frontend scan summary reads ---
+    # Flat schema: section_order is a list of strings; synthesize the nested shape the frontend expects.
+    section_order = merged.get("section_order") or []
+    if isinstance(section_order, list) and section_order:
+        synthesized_sections = [
+            {"id": s, "content_type": s, "elements": [], "highlights": []}
+            for s in section_order if isinstance(s, str)
+        ]
+    else:
+        # Legacy nested schema already has sections as list of dicts
+        synthesized_sections = [s for s in (merged.get("sections") or []) if isinstance(s, dict)]
+
+    persuasion_triggers = merged.get("persuasion_triggers") or []
+    if not isinstance(persuasion_triggers, list):
+        persuasion_triggers = []
+    # Legacy fallback: diction.triggers
+    if not persuasion_triggers:
+        diction = merged.get("diction", {})
+        persuasion_triggers = (diction.get("triggers") or []) if isinstance(diction, dict) else []
+
+    tone = merged.get("tone") or ""
+    if not tone:
+        diction = merged.get("diction", {})
+        tone = (diction.get("tone") or "") if isinstance(diction, dict) else ""
+
+    # The `inspiration` dict sent back to the frontend becomes `competitorDna` on generate calls.
+    # We embed the flat fields directly AND add the nested shapes the frontend UI reads.
+    inspiration_out = {
+        **merged,
+        "sections": synthesized_sections,
+        "diction": {"tone": tone, "triggers": persuasion_triggers},
+    }
+
+    # --- Derive conversion drivers ---
     drivers: list[str] = []
-    hero = merged.get("hero", {})
-    if isinstance(hero, dict) and hero.get("layout"):
-        layout_name = str(hero["layout"]).replace("_", " ").title()
-        drivers.append(f"{layout_name} Hero Layout")
-    if isinstance(to, dict) and to.get("gradients") and to["gradients"] != "none":
-        drivers.append("Gradient CTAs")
-    sp = merged.get("social_proof", {})
-    if isinstance(sp, dict) and sp.get("type"):
-        sp_name = str(sp["type"]).replace("_", " ").title()
-        drivers.append(f"{sp_name} Social Proof")
-    sections = merged.get("sections", [])
-    if isinstance(sections, list):
-        for s in sections:
-            if not isinstance(s, dict):
-                continue
-            ct = s.get("content_type", "")
-            if ct == "testimonials" and "Testimonials Section" not in drivers:
-                drivers.append("Testimonials Section")
-            elif ct == "steps" and "Step-by-Step Flow" not in drivers:
-                drivers.append("Step-by-Step Flow")
-            elif ct == "security" and "Trust & Security Badges" not in drivers:
-                drivers.append("Trust & Security Badges")
-            elif ct == "pricing" and "Pricing Table" not in drivers:
-                drivers.append("Pricing Table")
-            if len(drivers) >= 5:
-                break
-    if isinstance(ds, dict) and ds.get("layout") and len(drivers) < 3:
-        layout_desc = str(ds["layout"])
-        if "bento" in layout_desc.lower():
-            drivers.append("Bento Grid Layout")
-        elif "grid" in layout_desc.lower():
-            drivers.append("Grid-Based Layout")
-    diction = merged.get("diction", {})
-    triggers = diction.get("triggers", []) if isinstance(diction, dict) else []
-    if isinstance(triggers, list):
-        for t in triggers:
-            t_str = str(t).title()
-            if t_str not in drivers and len(drivers) < 5:
-                drivers.append(f"{t_str} Strategy")
+    hero_layout = merged.get("hero_layout") or (
+        merged.get("hero", {}).get("layout") if isinstance(merged.get("hero"), dict) else None
+    )
+    if hero_layout:
+        drivers.append(f"{str(hero_layout).replace('_', ' ').title()} Hero Layout")
+    gradients = ghost_theme.get("gradients", "")
+    if gradients and str(gradients).strip().lower() not in ("none", ""):
+        drivers.append("Gradient Design")
+    sp_type = merged.get("social_proof_type") or (
+        merged.get("social_proof", {}).get("type") if isinstance(merged.get("social_proof"), dict) else None
+    )
+    if sp_type and sp_type != "none":
+        drivers.append(f"{str(sp_type).replace('_', ' ').title()} Social Proof")
+    _section_driver_map = {
+        "testimonials": "Testimonials Section",
+        "steps": "Step-by-Step Flow",
+        "security": "Trust & Security Badges",
+        "pricing": "Pricing Table",
+        "faq": "FAQ Section",
+        "integrations": "Integrations Showcase",
+    }
+    for s in section_order[:10]:
+        if len(drivers) >= 5:
+            break
+        label = _section_driver_map.get(str(s).lower())
+        if label and label not in drivers:
+            drivers.append(label)
+    for t in persuasion_triggers[:5]:
+        if len(drivers) >= 5:
+            break
+        t_str = str(t).title()
+        if t_str not in drivers:
+            drivers.append(t_str)
+
+    log.info(
+        "extract_inspiration: palette=%s, sections=%d, triggers=%d, drivers=%d",
+        len(ghost_theme.get("palette") or []),
+        len(synthesized_sections),
+        len(persuasion_triggers),
+        len(drivers),
+    )
 
     resp: dict = {
-        "inspiration": merged,
+        "inspiration": inspiration_out,
         "sources": len(results),
         "themeOverrides": ghost_theme,
         "conversionDrivers": drivers[:5],
@@ -2525,21 +2608,69 @@ def get_experience_library(format: str = ""):
 
 
 # --- Beacon (Supabase): CTA-only (button_click) → cta_events ----------------
+def _posthog_capture(distinct_id: str, event: str, properties: dict) -> None:
+    """Send event to PostHog Capture API if POSTHOG_API_KEY is set. Swallow errors."""
+    if not POSTHOG_API_KEY or not POSTHOG_HOST:
+        return
+    try:
+        payload = {
+            "api_key": POSTHOG_API_KEY,
+            "distinct_id": distinct_id,
+            "event": event,
+            "properties": {k: v for k, v in properties.items() if v is not None},
+        }
+        with httpx.Client() as client:
+            client.post(
+                f"{POSTHOG_HOST}/capture/",
+                json=payload,
+                timeout=5.0,
+            )
+    except Exception as e:
+        log.debug("PostHog capture failed: %s", e)
+
+
+def _normalize_layer(layer: str) -> str:
+    """Unify layer format: 'layer-1' -> '1', '1' -> '1', so beacon and agent views match."""
+    s = (layer or "").strip()
+    if s.startswith("layer-"):
+        return s[6:].strip() or s
+    return s
+
+
+def _normalize_variant_id(variant_id: str) -> str:
+    """Unify variant_id: '1' or 1 -> 'variant-1', 'variant-1' -> 'variant-1', so beacon and agent views match."""
+    s = (variant_id or "").strip()
+    if s in ("1", "2", "3", "4"):
+        return f"variant-{s}"
+    if s.isdigit() and 1 <= int(s) <= 4:
+        return f"variant-{s}"
+    if s.startswith("variant-") and len(s) == 10 and s[-1] in "1234":
+        return s
+    return s
+
+
 @app.post("/beacon")
 def beacon(body: BeaconBody):
-    """Record CTA (button) click into Supabase cta_events. Config from backend .env. Only button_click accepted."""
+    """Record CTA (button) click into Supabase cta_events. Optional event_source: 'real' (default), 'simulated', 'simgym' for SimGym-style traffic."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=503, detail="Analytics not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env)")
     if body.event != "button_click":
         raise HTTPException(status_code=400, detail="event must be button_click (CTA only)")
     if not (body.repo_full_name or "").strip() or not (body.layer or "").strip() or not (body.variant_id or "").strip():
         raise HTTPException(status_code=400, detail="repo_full_name, layer, and variant_id are required")
+    event_source = (body.event_source or "").strip().lower()
+    if event_source not in ("simulated", "simgym"):
+        event_source = "real"
+    repo = (body.repo_full_name or "").strip()
+    layer = _normalize_layer((body.layer or "").strip())
+    variant_id = _normalize_variant_id((body.variant_id or "").strip())
     row = {
-        "repo_full_name": (body.repo_full_name or "").strip(),
-        "layer": (body.layer or "").strip(),
-        "variant_id": (body.variant_id or "").strip(),
+        "repo_full_name": repo,
+        "layer": layer,
+        "variant_id": variant_id,
         "cta_label": (body.cta_label or "").strip() or None,
         "cta_id": (body.cta_id or "").strip() or None,
+        "event_source": event_source,
         "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
     }
     url = f"{SUPABASE_URL}/rest/v1/cta_events"
@@ -2558,22 +2689,111 @@ def beacon(body: BeaconBody):
     if r.status_code >= 400:
         log.warning("beacon Supabase insert failed: %s %s", r.status_code, r.text)
         raise HTTPException(status_code=500, detail="Analytics write failed")
+    distinct_id = f"{event_source}:{repo}:{layer}:{variant_id}"
+    _posthog_capture(distinct_id, "button_click", {
+        "repo_full_name": repo,
+        "layer": layer,
+        "variant_id": variant_id,
+        "cta_label": (body.cta_label or "").strip() or None,
+        "cta_id": (body.cta_id or "").strip() or None,
+        "event_source": event_source,
+    })
+    return {"ok": True}
+
+
+@app.post("/beacon-time")
+async def beacon_time(request: Request):
+    """Record time-on-page (or section) into Supabase time_events.
+
+    Accepts either application/json or a plain-text JSON body so browser keepalive/sendBeacon
+    requests can avoid a CORS preflight and still be parsed server-side.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Analytics not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env)")
+    try:
+        raw = await request.body()
+        if not raw:
+            raise ValueError("empty body")
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            payload = json.loads(raw.decode("utf-8"))
+        else:
+            payload = json.loads(raw.decode("utf-8"))
+        body = BeaconTimeBody(**payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid beacon-time payload: {e}") from e
+    repo = (body.repo_full_name or "").strip()
+    layer = _normalize_layer((body.layer or "").strip())
+    variant_id = _normalize_variant_id((body.variant_id or "").strip())
+    if not repo or not layer or not variant_id:
+        raise HTTPException(status_code=400, detail="repo_full_name, layer, and variant_id are required")
+    duration = float(body.duration_seconds) if body.duration_seconds is not None else 0.0
+    if duration < 0:
+        duration = 0.0
+    event_source = (body.event_source or "").strip().lower()
+    if event_source not in ("simulated", "simgym"):
+        event_source = "real"
+    row = {
+        "repo_full_name": repo,
+        "layer": layer,
+        "variant_id": variant_id,
+        "event_source": event_source,
+        "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "duration_seconds": round(duration, 2),
+        "section_id": (body.section_id or "").strip() or None,
+    }
+    url = f"{SUPABASE_URL}/rest/v1/time_events"
+    with httpx.Client() as client:
+        r = client.post(
+            url,
+            json=row,
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            timeout=10.0,
+        )
+    if r.status_code >= 400:
+        log.warning("beacon-time Supabase insert failed: %s %s", r.status_code, r.text)
+        raise HTTPException(status_code=500, detail="Analytics write failed")
+    distinct_id = f"{event_source}:{repo}:{layer}:{variant_id}"
+    _posthog_capture(distinct_id, "time_on_page", {
+        "repo_full_name": repo,
+        "layer": layer,
+        "variant_id": variant_id,
+        "event_source": event_source,
+        "duration_seconds": round(duration, 2),
+        "section_id": (body.section_id or "").strip() or None,
+    })
     return {"ok": True}
 
 
 # --- Analytics (Supabase): cta_by_variant for bot / dashboard ------------------
 @app.get("/analytics")
-def analytics(repo: str = "", layer: str = ""):
-    """Query CTA clicks by variant (repo + optional layer). Reads from cta_by_variant."""
+def analytics(repo: str = "", layer: str = "", source: str = "all"):
+    """Query CTA clicks by variant. source=all (default) uses cta_by_variant; source=real|simulated uses cta_by_variant_by_source (SimGym)."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=503, detail="Analytics not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env)")
     if not (repo or "").strip():
         raise HTTPException(status_code=400, detail="Query param repo is required (e.g. ?repo=owner/name)")
-    url = f"{SUPABASE_URL}/rest/v1/cta_by_variant"
-    params: dict[str, str] = {
-        "repo_full_name": f"eq.{repo.strip()}",
-        "select": "repo_full_name,layer,variant_id,cta_clicks",
-    }
+    source = (source or "all").strip().lower()
+    if source not in ("all", "real", "simulated"):
+        source = "all"
+    if source == "all":
+        url = f"{SUPABASE_URL}/rest/v1/cta_by_variant"
+        params: dict[str, str] = {
+            "repo_full_name": f"eq.{repo.strip()}",
+            "select": "repo_full_name,layer,variant_id,cta_clicks",
+        }
+    else:
+        url = f"{SUPABASE_URL}/rest/v1/cta_by_variant_by_source"
+        params = {
+            "repo_full_name": f"eq.{repo.strip()}",
+            "event_source": f"eq.{source}",
+            "select": "repo_full_name,layer,variant_id,cta_clicks",
+        }
     if (layer or "").strip():
         params["layer"] = f"eq.{layer.strip()}"
     with httpx.Client() as client:
@@ -2590,7 +2810,9 @@ def analytics(repo: str = "", layer: str = ""):
     if r.status_code >= 400:
         log.warning("analytics Supabase query failed: %s %s", r.status_code, r.text)
         raise HTTPException(status_code=500, detail="Analytics query failed")
-    return {"data": r.json()}
+    data = r.json()
+    # When using by_source, aggregate same variant across layers if needed; response shape is same (repo_full_name, layer, variant_id, cta_clicks)
+    return {"data": data, "source": source}
 
 
 def _analyze_variant_structure(tsx: str) -> dict:
@@ -2640,6 +2862,12 @@ class AnalyzeVariantsBody(BaseModel):
     variants: list[str] = []
 
 
+class RecordVariantSnapshotsBody(BaseModel):
+    repo_full_name: str
+    layer: str
+    variants: list[str] = []  # 4 TSX strings, variant order 1..4
+    source: str = "deploy"
+
 @app.post("/analyze-variants")
 def analyze_variants(body: AnalyzeVariantsBody):
     """Accept { variants: string[] }, run _analyze_variant_structure on each TSX; return analysis list."""
@@ -2648,6 +2876,61 @@ def analyze_variants(body: AnalyzeVariantsBody):
     analyses = [_analyze_variant_structure(v) for v in body.variants]
     return {"analyses": analyses}
 
+
+@app.post("/record-variant-snapshots")
+def record_variant_snapshots(body: RecordVariantSnapshotsBody):
+    """Store independent variables per variant in variant_snapshots (for learning: diff best vs others). Call after deploy."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    repo = (body.repo_full_name or "").strip()
+    layer = (body.layer or "").strip()
+    if not repo or not layer:
+        raise HTTPException(status_code=400, detail="repo_full_name and layer are required")
+    variants = body.variants or []
+    source = (body.source or "deploy").strip() or "deploy"
+    if len(variants) != 4:
+        raise HTTPException(status_code=400, detail="variants must have exactly 4 TSX strings")
+    inserted = _record_variant_snapshots_internal(repo, layer, variants, source)
+    return {"ok": True, "inserted": inserted}
+
+
+def _record_variant_snapshots_internal(
+    repo_full_name: str, layer: str, variant_tsx_list: list[str], source: str = "deploy"
+) -> int:
+    """Insert variant_snapshots rows for the four variants. Returns number inserted. No-op if Supabase not configured."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or len(variant_tsx_list) != 4:
+        return 0
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    url = f"{SUPABASE_URL}/rest/v1/variant_snapshots"
+    inserted = 0
+    with httpx.Client() as client:
+        for i, tsx in enumerate(variant_tsx_list):
+            analysis = _analyze_variant_structure(tsx)
+            variant_id = f"variant-{i + 1}"
+            row = {
+                "repo_full_name": repo_full_name,
+                "layer": layer,
+                "variant_id": variant_id,
+                "source": source,
+                "sections": analysis.get("sections") or [],
+                "ctas": analysis.get("ctas") or [],
+                "tailwind_colors": analysis.get("tailwindColors") or [],
+                "font_imports": analysis.get("fontImports") or [],
+                "responsive": bool(analysis.get("responsive")),
+                "animated": bool(analysis.get("animated")),
+                "line_count": analysis.get("lineCount"),
+            }
+            r = client.post(url, json=row, headers=headers, timeout=10.0)
+            if r.status_code < 400:
+                inserted += 1
+            else:
+                log.warning("variant_snapshots insert failed for %s: %s %s", variant_id, r.status_code, r.text)
+    return inserted
 
 @app.get("/dashboard-data")
 def dashboard_data(repo: str = ""):
@@ -2693,6 +2976,22 @@ def dashboard_data(repo: str = ""):
         for i, v in enumerate(variants_out):
             v["rank"] = i + 1
         top_variant_id = variants_out[0].get("variant_id") if variants_out else None
+    # time_by_variant (all sources) for same repo
+    time_by_variant: dict[str, float] = {}
+    url_time = f"{SUPABASE_URL}/rest/v1/time_by_variant"
+    params_time = {"repo_full_name": f"eq.{repo}", "select": "variant_id,layer,total_seconds"}
+    with httpx.Client() as client:
+        rt = client.get(url_time, params=params_time, headers=headers, timeout=10.0)
+        if rt.status_code < 400:
+            raw_t = rt.json()
+            rows_t = raw_t if isinstance(raw_t, list) else []
+            for row_t in rows_t:
+                vid = (row_t.get("variant_id") or "").strip()
+                if vid:
+                    time_by_variant[vid] = time_by_variant.get(vid, 0) + float(row_t.get("total_seconds") or 0)
+    for v in variants_out:
+        vid = v.get("variant_id") or ""
+        v["total_seconds"] = round(time_by_variant.get(vid, 0), 1)
     # cta_events (recent for timeline)
     url_events = f"{SUPABASE_URL}/rest/v1/cta_events"
     params_events = {
@@ -2827,6 +3126,8 @@ def build_export_bundle(body: BuildExportBundleBody):
             body.repo_full_name.strip(),
             body.layer.strip(),
             beacon_url,
+            posthog_key=POSTHOG_API_KEY or None,
+            posthog_host=POSTHOG_HOST or None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2861,6 +3162,8 @@ def create_repo_and_push(body: CreateRepoAndPushBody):
             full_name,
             (body.layer or "1").strip(),
             beacon_url,
+            posthog_key=POSTHOG_API_KEY or None,
+            posthog_host=POSTHOG_HOST or None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2869,6 +3172,8 @@ def create_repo_and_push(body: CreateRepoAndPushBody):
     except httpx.HTTPStatusError as e:
         log.warning("github push failed: %s %s", e.response.status_code, e.response.text)
         raise HTTPException(status_code=502, detail=f"GitHub push error: {e.response.text}") from e
+    layer = (body.layer or "1").strip()
+    _record_variant_snapshots_internal(full_name, layer, body.variant_tsx_list, "deploy")
     return {"repo_full_name": full_name, "ok": True}
 
 

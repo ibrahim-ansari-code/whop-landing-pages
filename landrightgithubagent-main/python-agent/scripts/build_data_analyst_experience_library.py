@@ -33,6 +33,7 @@ from main import (
     _describe_cta_structure,
     _fetch_variant_files,
     _get_cta_by_variant,
+    _get_time_by_variant,
 )
 
 GROUP_SIZE = 3
@@ -95,14 +96,16 @@ def _run_rollout(
     best_cta_desc: str,
     second_cta_desc: str,
     experience_library: list[str],
+    variant_times: dict[str, float] | None = None,
 ) -> str:
     """One data analyst rollout: decide whether to adjust, and how to change pages based on data."""
+    times = variant_times or {}
     experiences_block = ""
     if experience_library:
         bullets = "\n".join(f"• {e}" for e in experience_library[:20])
         experiences_block = "\n\nConsider this experiential knowledge:\n" + bullets
     system = (
-        "You are a data analyst for a landing page A/B test. Given variant CTA click counts and CTA structure summaries, "
+        "You are a data analyst for a landing page A/B test. Given variant CTA click counts (and time on page when available) and CTA structure summaries, "
         "decide whether to run the CTA alignment pipeline (align underperforming variants to the best variant's CTA structure). "
         "If you recommend running it, also specify what should change in the underperforming pages based on the data (CTA placement/count/prominence). "
         "Output format:\n"
@@ -111,10 +114,12 @@ def _run_rollout(
         "Plan: 2-4 short bullets describing what CTA changes to make, grounded in the best variant's CTA structure.\n"
         + experiences_block
     )
+    best_time_str = f", {int(round(times.get(best_id) or 0))}s total time" if times.get(best_id) else ""
+    second_time_str = f", {int(round(times.get(second_id) or 0))}s total time" if times.get(second_id) else ""
     user = (
-        f"Variant click counts:\n{variant_clicks_str}\n\n"
-        f"Best variant: {best_id} ({best_clicks} CTA clicks). CTA structure: {best_cta_desc}\n\n"
-        f"Second variant: {second_id} ({second_clicks} CTA clicks). CTA structure: {second_cta_desc}\n\n"
+        f"Variant click counts (and time on page when available):\n{variant_clicks_str}\n\n"
+        f"Best variant: {best_id} ({best_clicks} CTA clicks{best_time_str}). CTA structure: {best_cta_desc}\n\n"
+        f"Second variant: {second_id} ({second_clicks} CTA clicks{second_time_str}). CTA structure: {second_cta_desc}\n\n"
         "Should we run the CTA alignment pipeline? Follow the required output format."
     )
     return _call_claude(system, user, max_tokens=512, temperature=ROLLOUT_TEMPERATURE)
@@ -197,8 +202,9 @@ def _group_advantage_extraction(
 ) -> list[str]:
     system = (
         "You extract group-relative semantic advantage from data analyst rollouts. "
-        "Compare the summarized decisions and rewards; output generalizable lessons about how to read CTA metrics, when to run or skip alignment, and how to design page-change plans based on the data, "
+        "Compare the summarized decisions and rewards; output generalizable lessons about how to read CTA metrics and time-on-page, when to run or skip alignment, and how to design page-change plans based on the data, "
         "without hard-coding specific CTA counts or layout patterns. "
+        "When time-on-page data is present, consider both click gap and time gap; lessons may reflect when time-on-page supports or contradicts the click-based decision. "
         "Focus on meta-principles of analysis and adjustment, not a single \"optimal\" CTA configuration. "
         "Output <Experiences>...</Experiences> with numbered items (short, actionable)."
     )
@@ -275,19 +281,27 @@ def _group_experience_update(existing_library: list[str], new_experiences: list[
     return out[:EXPERIENCE_DECAY_MAX_ITEMS]
 
 
-def _build_queries() -> list[tuple[str, str, dict[str, int], str, int, str, int, str, str]]:
-    """Returns list of (repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc)."""
+def _build_queries() -> list[tuple[str, str, dict[str, int], str, int, str, int, str, str, dict[str, float]]]:
+    """Returns list of (repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc, time_by_variant)."""
     rows = _get_cta_by_variant()
     if not rows:
         return []
     from collections import defaultdict
+    time_rows = _get_time_by_variant()
+    by_repo_layer_time: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
+    for r in time_rows:
+        repo = (r.get("repo_full_name") or "").strip()
+        layer = (r.get("layer") or "").strip()
+        vid = (r.get("variant_id") or "").strip()
+        if repo and layer and vid:
+            by_repo_layer_time[(repo, layer)][vid] = float(r.get("total_seconds") or 0)
     by_repo_layer: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in rows:
         repo = (r.get("repo_full_name") or "").strip()
         layer = (r.get("layer") or "").strip()
         if repo and layer:
             by_repo_layer[(repo, layer)].append(r)
-    queries: list[tuple[str, str, dict[str, int], str, int, str, int, str, str]] = []
+    queries: list[tuple[str, str, dict[str, int], str, int, str, int, str, str, dict[str, float]]] = []
     for (repo, layer), group in by_repo_layer.items():
         if REPO_ALLOW_LIST and repo not in REPO_ALLOW_LIST:
             continue
@@ -300,7 +314,11 @@ def _build_queries() -> list[tuple[str, str, dict[str, int], str, int, str, int,
                 return vid
             return f"variant-{vid}" if (isinstance(vid, str) and vid.isdigit()) else vid
         normalized = {to_file_key(k): v for k, v in variant_clicks.items()}
-        sorted_variants = sorted(normalized.items(), key=lambda x: -x[1])
+        time_map = by_repo_layer_time.get((repo, layer), {})
+        sorted_variants = sorted(
+            normalized.items(),
+            key=lambda x: (-x[1], -(time_map.get(x[0]) or 0)),
+        )
         best_id, best_clicks = sorted_variants[0]
         second_id, second_clicks = sorted_variants[1]
         best_cta_desc = ""
@@ -313,7 +331,7 @@ def _build_queries() -> list[tuple[str, str, dict[str, int], str, int, str, int,
                 second_cta_desc = _describe_cta_structure(files[second_id])
         except Exception:
             pass
-        queries.append((repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc))
+        queries.append((repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc, time_map))
     return queries
 
 
@@ -328,8 +346,13 @@ def run_pipeline(epochs: int = EPOCHS, group_size: int = GROUP_SIZE) -> list[str
     print(f"Loaded {len(library)} experiences; {len(queries)} queries; {epochs} epochs; group_size={group_size}")
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
-        for q_idx, (repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc) in enumerate(queries):
-            variant_clicks_str = "\n".join(f"  {k}: {v} clicks" for k, v in sorted(variant_clicks.items()))
+        for q_idx, (repo, layer, variant_clicks, best_id, best_clicks, second_id, second_clicks, best_cta_desc, second_cta_desc, time_by_variant) in enumerate(queries):
+            def _line(vid: str, clicks: int) -> str:
+                t = time_by_variant.get(vid)
+                if t is not None and t > 0:
+                    return f"  {vid}: {clicks} clicks, {int(round(t))}s total time"
+                return f"  {vid}: {clicks} clicks"
+            variant_clicks_str = "\n".join(_line(k, variant_clicks.get(k, 0)) for k in sorted(variant_clicks.keys()))
             should_adjust_truth = (best_clicks - second_clicks) >= CTA_THRESHOLD
             rollouts: list[str] = []
             for _ in range(group_size):
@@ -343,6 +366,7 @@ def run_pipeline(epochs: int = EPOCHS, group_size: int = GROUP_SIZE) -> list[str
                         best_cta_desc,
                         second_cta_desc,
                         library,
+                        variant_times=time_by_variant,
                     )
                     if out:
                         rollouts.append(out)

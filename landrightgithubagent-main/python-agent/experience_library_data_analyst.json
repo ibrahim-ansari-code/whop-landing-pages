@@ -6,5 +6,6 @@
   "**Consistent Messaging Consolidation**: High-performing CTA reductions typically involve merging similar actions rather than random removal. Group related CTAs and eliminate true duplicates first.",
   "**Run Adjustments for Clutter**: If analysis shows >6 total CTAs with scattered placement, default to RUN_ADJUST rather than SKIP_ALIGNMENT. Clutter reduction has high success probability.",
   "**Convergence Validation**: When multiple analytical approaches yield identical high rewards (0.95+) and similar solutions, you've likely discovered a fundamental UX principle that transcends specific implementation details and is worth codifying across other variants.",
-  "**4-CTA Sweet Spot**: The 4-total-CTA configuration with 2:2 distribution appears to be a local optimum for conversion-focused pages. Test this as a baseline before exploring other counts."
+  "**4-CTA Sweet Spot**: The 4-total-CTA configuration with 2:2 distribution appears to be a local optimum for conversion-focused pages. Test this as a baseline before exploring other counts.",
+  "**Section visibility**: When section-level time (section_id in time_events) is available, consider which sections get the most view time; hero and above-the-fold sections often drive more engagement. Use visibility data to inform CTA placement and variant comparison."
 ]

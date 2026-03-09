@@ -100,6 +100,27 @@ export async function POST(request: NextRequest) {
   const errors: string[] = [];
   const filePaths = Object.keys(finalFiles).sort();
 
+  // Check sync agent is reachable before pushing many files (avoids N× "fetch failed")
+  try {
+    const healthRes = await fetch(`${syncAgentUrl}/health`, { method: "GET" });
+    if (!healthRes.ok) {
+      return NextResponse.json(
+        {
+          error: `Sync agent at ${syncAgentUrl} returned ${healthRes.status}. Start the agent (e.g. port 4000) and set SYNC_AGENT_URL in .env.local.`,
+        },
+        { status: 503 }
+      );
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Connection failed";
+    return NextResponse.json(
+      {
+        error: `Cannot reach sync agent at ${syncAgentUrl}. ${msg} Start the Python agent and set SYNC_AGENT_URL in .env.local.`,
+      },
+      { status: 503 }
+    );
+  }
+
   for (const filePath of filePaths) {
     const payload = {
       filePath,
@@ -129,6 +150,33 @@ export async function POST(request: NextRequest) {
       { status: 502 }
     );
   }
+
+  const backendUrl = process.env.NEXT_PUBLIC_GENERATE_API_URL?.trim().replace(/\/$/, "");
+  const variantPaths = ["app/variants/variant-1.tsx", "app/variants/variant-2.tsx", "app/variants/variant-3.tsx", "app/variants/variant-4.tsx"];
+  const variantTsxList = variantPaths.map((p) => finalFiles[p]).filter(Boolean);
+  if (backendUrl && variantTsxList.length === 4) {
+    const layerName = typeof body?.layerName === "string" && body.layerName.trim() !== "" ? body.layerName.trim() : DEFAULT_LAYER_NAME;
+    const layerForSnapshots = layerName.replace(/^layer-/, "") || "1";
+    try {
+      const snapRes = await fetch(`${backendUrl}/record-variant-snapshots`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repo_full_name: repoFullName,
+          layer: layerForSnapshots,
+          variants: variantTsxList,
+          source: "deploy",
+        }),
+      });
+      if (!snapRes.ok) {
+        const errText = await snapRes.text();
+        console.warn("record-variant-snapshots failed (push succeeded):", snapRes.status, errText);
+      }
+    } catch (e) {
+      console.warn("record-variant-snapshots request failed (push succeeded):", e);
+    }
+  }
+
   return NextResponse.json({
     ok: true,
     message: `Bundle pushed (${filePaths.length} files). Repo is ready to deploy to Vercel.`,
