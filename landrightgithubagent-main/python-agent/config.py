@@ -42,6 +42,10 @@ ADJUST_COMMIT_WINDOW_SECONDS = max(60, int(os.environ.get("ADJUST_COMMIT_WINDOW_
 REPO_ALLOW_LIST = [
     s.strip() for s in (os.environ.get("REPO_ALLOW_LIST") or "").split(",") if s.strip()
 ]
+# Optional: repos in this list are never adjusted (judge bypassed, always skip). Use to show "no edits" demo.
+REPO_SKIP_ADJUST_LIST = [
+    s.strip() for s in (os.environ.get("REPO_SKIP_ADJUST_LIST") or "").split(",") if s.strip()
+]
 
 # Sync API: optional API key (Landright app sends x-api-key / Bearer)
 SYNC_AGENT_API_KEY = (os.environ.get("SYNC_AGENT_API_KEY") or "").strip()

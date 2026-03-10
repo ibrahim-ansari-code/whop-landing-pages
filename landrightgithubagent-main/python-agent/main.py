@@ -34,6 +34,7 @@ from config import (
     GITHUB_REPO_FULL_NAME,
     GITHUB_TOKEN,
     REPO_ALLOW_LIST,
+    REPO_SKIP_ADJUST_LIST,
     SUPABASE_SERVICE_ROLE_KEY,
     SUPABASE_URL,
     SYNC_AGENT_API_KEY,
@@ -1833,8 +1834,12 @@ def _should_run_adjust_llm_judge(
         experiences_block = "\n\nConsider this experiential knowledge:\n" + bullets
     system = (
         "You are a data analyst for a landing page A/B test. Given variant CTA click counts and CTA structure summaries, "
-        "decide whether to run the CTA alignment pipeline (align underperforming variants to the best variant's CTA structure). "
-        "If you recommend running it, also state what should change in the underperforming pages based on the data (CTA placement/count/prominence). "
+        "decide whether to run the CTA alignment pipeline (align underperforming variants to the best variant's CTA structure).\n\n"
+        "Rule: When the best variant has at least 10 more CTA clicks than the second-best, OR meaningfully more time-on-page, "
+        "and the best variant's CTA structure is not 'unknown', recommend RUN_ADJUST. That is a clear performance gap; the pipeline should align underperformers to the winner.\n"
+        "Recommend SKIP only when (1) all variants are statistically similar (e.g. gap < 10 clicks and similar time), or (2) best variant CTA structure is 'unknown' (no GitHub access), or (3) we already ran an alignment very recently on this repo and the experiential knowledge says to wait.\n\n"
+        "Do not SKIP solely because of a generic over-fitting warning. The over-fitting lesson applies to repeated alignments in quick succession, not to a first-time clear winner.\n\n"
+        "If you recommend running it, state what should change in the underperforming pages (CTA placement/count/prominence). "
         "Output format:\n"
         "Decision: RUN_ADJUST or SKIP\n"
         "Update: comma-separated variant ids to update (or NONE)\n"
@@ -1875,6 +1880,10 @@ def _should_run_adjust_llm_judge(
             log.info("Judge: RUN_ADJUST for %s layer %s. Response preview: %s", repo_full_name, layer, preview)
             return True, preview
         if "SKIP" in raw:
+            # Fallback: clear performance gap (>=10 clicks) and we have CTA structure => run anyway
+            if (best_clicks - second_clicks >= 10) and (best_cta_desc and best_cta_desc != "unknown"):
+                log.info("Judge: SKIP overridden to RUN_ADJUST for %s layer %s (gap=%s, clear winner)", repo_full_name, layer, best_clicks - second_clicks)
+                return True, preview + " [overridden: gap>=10]"
             log.info("Judge: SKIP for %s layer %s. Response preview: %s", repo_full_name, layer, preview)
             return False, preview
         run = best_clicks - second_clicks >= CTA_THRESHOLD
@@ -2049,6 +2058,9 @@ def _cron_check_and_adjust():
         if REPO_ALLOW_LIST and repo not in REPO_ALLOW_LIST:
             log.info("Skipping repo %s (layer %s): not in REPO_ALLOW_LIST", repo, layer)
             continue
+        if repo in REPO_SKIP_ADJUST_LIST:
+            log.info("Skipping repo %s (layer %s): in REPO_SKIP_ADJUST_LIST (no edits)", repo, layer)
+            continue
         raw_clicks = {r["variant_id"]: int(r.get("cta_clicks") or 0) for r in group}
         variant_clicks = _normalize_variant_clicks(raw_clicks)
         state_key = (repo, layer)
@@ -2067,6 +2079,12 @@ def _cron_check_and_adjust():
                 "Adjust rate-limited for %s layer %s (%s commits in last %ss). Waiting for new data + judge approval.",
                 repo, layer, len(commit_times), ADJUST_COMMIT_WINDOW_SECONDS,
             )
+            continue
+        # Skip repos we cannot access (e.g. demo/other-page with no app install). Avoids judge + pipeline for non-installed repos.
+        try:
+            _fetch_variant_files(repo)
+        except Exception as e:
+            log.info("Skipping repo %s (layer %s): no GitHub access (cannot fetch variant files): %s", repo, layer, e)
             continue
         try:
             force_run = bool(os.environ.get("FORCE_RUN_ADJUST", "").strip().lower() in ("1", "true", "yes"))

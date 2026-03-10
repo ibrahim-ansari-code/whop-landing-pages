@@ -8,10 +8,5 @@
   "**Convergence Validation**: When multiple analytical approaches yield identical high rewards (0.95+) and similar solutions, you've likely discovered a fundamental UX principle that transcends specific implementation details and is worth codifying across other variants.",
   "**4-CTA Sweet Spot**: The 4-total-CTA configuration with 2:2 distribution appears to be a local optimum for conversion-focused pages. Test this as a baseline before exploring other counts.",
   "**Section visibility**: When section-level time (section_id in time_events) is available, consider which sections get the most view time; hero and above-the-fold sections often drive more engagement. Use visibility data to inform CTA placement and variant comparison.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner.",
-  "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner."
+  "**Over-fitting caveat**: In some past runs, after we aligned underperformers to the best variant, a later period showed degradation (best changed or total clicks dropped). Use that to be cautious about running another alignment soon after a recent one on the same repo. It does NOT mean you should SKIP when there is a clear first-time winner (e.g. best has 20%+ more clicks and more engagement time) — in that case recommend RUN_ADJUST."
 ]

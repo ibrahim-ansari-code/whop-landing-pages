@@ -32,5 +32,7 @@
   "Membership and gated content: Lead with the benefit of joining (e.g. 'Join 1,200+ members') and use a single clear CTA; avoid stacking multiple sign-up buttons.",
   "Creator-led landing pages: Pair the creator's face or name with the main CTA so the offer feels personal; 'Join [Creator]' or 'Get [Creator]'s course' aligns with how Whop and similar audiences decide.",
   "Section visibility and engagement: Consider section visibility when comparing variants; hero and above-the-fold sections often drive more engagement and CTA clicks. Variants with stronger visibility on key sections (Hero, Features, Pricing) tend to convert better.",
-  "Visibility and CTA placement: Sections that get more view time (tracked via data-landright-section) are better candidates for primary CTAs; align CTA density with where users spend time."
+  "Visibility and CTA placement: Sections that get more view time (tracked via data-landright-section) are better candidates for primary CTAs; align CTA density with where users spend time.",
+  "When variant-1 outperformed (repo ibrahim-ansari-code/re), it had: sections ['Hero', 'Features', 'Footer']; CTAs ['call', 'Twitter', '--font-bebas', 'var(--font-manrope)', 'relative overflow-hidden']; responsive; animated. Prefer these patterns in future generations.",
+  "When variant-1 outperformed (repo ibrahim-ansari-code/hidden-studios), it had: sections ['Hero', 'Features', 'Footer']; CTAs ['CALL', '(e.currentTarget.style.color = \"#6B6B7A\")}\\n            >\\n              Twitter', '(e.currentTarget.style.color = \"#6B6B7A\")}\\n            >\\n              LinkedIn', '--font-bebas', '12px']; animated. Prefer these patterns in future generations."
 ]
