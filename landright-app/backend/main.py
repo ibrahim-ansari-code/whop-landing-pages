@@ -161,9 +161,9 @@ PROMPTS = _load_prompts()
 
 # --- Default (pre-built) experience library (paper: token prior from minimal ground-truth data) ---
 def _get_default_experience_library() -> list[str]:
-    """Load standard experience library from file; merge with learned entries from Supabase (source=generation)."""
+    """Load standard experience library from file only (no user-added or learned entries)."""
     path_str = os.environ.get("EXPERIENCE_LIBRARY_PATH", "").strip()
-    path = Path(path_str).resolve() if path_str else APP_DIR / "experience_library_default.json"
+    path = Path(path_str).resolve() if path_str else (APP_DIR / "experience_library_default.json")
     out: list[str] = []
     if path.exists():
         try:
@@ -188,38 +188,7 @@ def _get_default_experience_library() -> list[str]:
                 out = _experience_brief_to_list(md_path.read_text(encoding="utf-8"))
             except OSError:
                 pass
-    learned = _fetch_learned_experience_entries()
-    if learned:
-        out = out + learned
     return out
-
-
-def _fetch_learned_experience_entries(limit: int = 50) -> list[str]:
-    """Fetch learned generation lessons from Supabase experience_library_entries (source=generation)."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return []
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/experience_library_entries"
-        params = {"source": "eq.generation", "order": "created_at.desc", "limit": str(limit), "select": "entry"}
-        with httpx.Client() as client:
-            r = client.get(
-                url,
-                params=params,
-                headers={
-                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                    "Accept": "application/json",
-                },
-                timeout=5.0,
-            )
-        if r.status_code >= 400:
-            return []
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-        return [str(row.get("entry", "")).strip() for row in data if row.get("entry")]
-    except Exception:
-        return []
 
 
 def _get_prompt_system_text(prompt_id: str) -> str:
@@ -2321,13 +2290,8 @@ def generate(body: GenerateBody):
         variants = generate_template_variants(spec)
         return {"variants": variants, "source": "template", "experienceLibrary": []}
 
-    # Pre-built library when client sends empty (paper: token prior). Accept JSON (experienceLibrary) or MD (experienceLibraryMd).
-    if body.experienceLibrary is not None and len(body.experienceLibrary) > 0:
-        effective_library = body.experienceLibrary
-    elif body.experienceLibraryMd and body.experienceLibraryMd.strip():
-        effective_library = _experience_brief_to_list(body.experienceLibraryMd.strip())
-    else:
-        effective_library = _get_default_experience_library()
+    # Always use server-side experience library (file only); ignore client-sent experienceLibrary/experienceLibraryMd.
+    effective_library = _get_default_experience_library()
 
     max_tokens = SINGLE_VARIANT_MAX_TOKENS
 

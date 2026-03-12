@@ -1,0 +1,17 @@
+{
+  "spec": {
+    "websiteInformation": {
+      "name": "SimGym",
+      "tagline": "Landing page simulation",
+      "whatTheyDo": "SimGym runs simulated visitors against generated landing variants to collect CTA and time-on-page data for learning."
+    },
+    "skillsOrNiches": [],
+    "goals": ["Learn more", "Start free trial"],
+    "ctaType": "button",
+    "ctaEntries": [
+      { "type": "button", "label": "Get started", "url": "https://example.com/signup" }
+    ],
+    "features": []
+  },
+  "promptId": "simgym-initial"
+}

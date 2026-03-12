@@ -27,10 +27,13 @@ from config import (
     MAX_ADJUST_COMMITS_PER_WINDOW,
     MAX_VARIANT_CHARS_FOR_CTA_ALIGN,
     ADJUST_COMMIT_WINDOW_SECONDS,
+    AGENT_DIR,
     DESIGN_SKILL_PATH_RESOLVED,
     EXPERIENCE_LIBRARY_CTA_PATH_RESOLVED,
     EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED,
     EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED,
+    EXPERIENCE_LIBRARY_MAX_ENTRIES,
+    EXPERIENCE_LIBRARY_SIMILARITY_SKIP_THRESHOLD,
     GITHUB_REPO_FULL_NAME,
     GITHUB_TOKEN,
     REPO_ALLOW_LIST,
@@ -398,6 +401,27 @@ def _fetch_variant_files(repo_full_name: str) -> dict[str, str]:
         except Exception as e:
             log.warning("Could not fetch %s: %s", path, e)
     return out
+
+
+def _get_variant_files_from_dir(export_dir: Path) -> dict[str, str]:
+    """Read variant-1..4 TSX from local export dir (app/variants/). Same keys as _fetch_variant_files."""
+    out: dict[str, str] = {}
+    variants_dir = export_dir / "app" / "variants"
+    for i in range(1, 5):
+        path = variants_dir / f"variant-{i}.tsx"
+        if path.exists():
+            out[f"variant-{i}"] = path.read_text(encoding="utf-8")
+        else:
+            log.warning("Variant file not found: %s", path)
+    return out
+
+
+def _write_variant_to_local(export_dir: Path, variant_id: str, content: str) -> None:
+    """Write variant TSX to export_dir/app/variants/{variant_id}.tsx."""
+    path = export_dir / "app" / "variants" / f"{variant_id}.tsx"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    log.info("Wrote %s", path)
 
 
 # Anthropic 200k token input limit. We truncate variant TSX and optionally verify with count_tokens when large.
@@ -1549,22 +1573,65 @@ def _record_snapshot_supabase(repo_full_name: str, layer: str, variant_id: str, 
         log.warning("Failed to record variant_snapshot for %s: %s", variant_id, e)
 
 
-def _append_experience_file(path_resolved: Path | None, entry: str) -> None:
-    """Append one lesson to a JSON experience library file (list or { experienceLibrary: list })."""
-    if not path_resolved or not path_resolved.exists() or not entry or not entry.strip():
+def _append_experience_file(path_resolved: Path | None, entry: str, force_append: bool = False) -> None:
+    """Append one lesson to a JSON experience library file. Trims to EXPERIENCE_LIBRARY_MAX_ENTRIES (drops oldest).
+    Skips add if new entry is too similar to an existing one (EXPERIENCE_LIBRARY_SIMILARITY_SKIP_THRESHOLD) or contradicts one.
+    When force_append=True (e.g. for round-learning to backend), always append without similarity check.
+    Writes directly to file so experience library is updated without manual edits."""
+    if not path_resolved or not entry or not entry.strip():
         return
+    import re
     import json
+    entry = entry.strip()
     try:
-        raw = path_resolved.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, list):
-            data.append(entry.strip())
-        elif isinstance(data, dict) and "experienceLibrary" in data:
-            data["experienceLibrary"] = list(data["experienceLibrary"]) + [entry.strip()]
+        if path_resolved.exists():
+            raw = path_resolved.read_text(encoding="utf-8")
+            data = json.loads(raw)
         else:
-            data = [entry.strip()]
+            path_resolved.parent.mkdir(parents=True, exist_ok=True)
+            data = []
+        if isinstance(data, dict) and "experienceLibrary" in data:
+            items = list(data["experienceLibrary"])
+        elif isinstance(data, list):
+            items = [str(x).strip() for x in data if x and str(x).strip()]
+        else:
+            items = []
+
+        if not force_append:
+            def _words(s: str) -> set[str]:
+                return set(re.findall(r"[a-z0-9]+", s.lower()))
+
+            new_words = _words(entry)
+            threshold = EXPERIENCE_LIBRARY_SIMILARITY_SKIP_THRESHOLD
+            skip_run = {"run", "adjust", "prefer", "recommend"}
+            skip_avoid = {"skip", "avoid", "do not", "caution", "wait"}
+            for existing in items:
+                if not existing:
+                    continue
+                ew = _words(existing)
+                if not new_words or not ew:
+                    continue
+                overlap = len(new_words & ew) / len(new_words | ew) if (new_words | ew) else 0
+                if overlap >= threshold:
+                    new_lower = entry.lower()
+                    exist_lower = existing.lower()
+                    if (any(x in new_lower for x in skip_run) and any(x in exist_lower for x in skip_avoid)) or (
+                        any(x in new_lower for x in skip_avoid) and any(x in exist_lower for x in skip_run)
+                    ):
+                        log.debug("Skip append: contradicts existing entry in %s", path_resolved.name)
+                        return
+                    log.debug("Skip append: too similar to existing in %s (overlap=%.2f)", path_resolved.name, overlap)
+                    return
+
+        items.append(entry)
+        if len(items) > EXPERIENCE_LIBRARY_MAX_ENTRIES:
+            items = items[-EXPERIENCE_LIBRARY_MAX_ENTRIES:]
+        if isinstance(data, dict) and "experienceLibrary" in data:
+            data["experienceLibrary"] = items
+        else:
+            data = items
         path_resolved.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        log.info("Appended to %s", path_resolved.name)
+        log.info("Appended to %s (total %s entries)", path_resolved.name, len(items))
     except Exception as e:
         log.warning("Failed to append experience file %s: %s", path_resolved, e)
 
@@ -1615,6 +1682,59 @@ def _top_section_summary(section_times: dict[str, float], limit: int = 3) -> str
     ordered = sorted(section_times.items(), key=lambda item: -float(item[1] or 0))
     parts = [f"{section_id} ({int(round(total_seconds))}s)" for section_id, total_seconds in ordered[:limit] if total_seconds]
     return ", ".join(parts)
+
+
+def _append_round_to_experience_libraries(
+    repo_full_name: str,
+    layer: str,
+    variant_clicks: dict[str, int],
+    time_by_variant: dict[str, float],
+    judge_decision: str,
+    files_updated: int,
+    round_label: str,
+) -> None:
+    """Append 1 summary + 3-4 takeaways to both libraries every round. Data analyst lines are about when to run adjust and interpreting data. Both libraries are used: data_analyst by the judge, generation by the backend for future variants."""
+    clicks_str = ", ".join(f"{vid}={variant_clicks.get(vid, 0)}" for vid in sorted(variant_clicks.keys()))
+    time_str = ""
+    if time_by_variant:
+        time_str = "; " + ", ".join(f"{vid}={int(round(time_by_variant[vid]))}s" for vid in sorted(time_by_variant.keys()) if time_by_variant.get(vid))
+    # Rotate which takeaways we add so we get variety and the library grows (avoid same 4 every round)
+    seed = hash(round_label) % 1000
+    def _pick_n(choices: list[str], n: int) -> list[str]:
+        if len(choices) <= n:
+            return choices
+        start = seed % len(choices)
+        return [choices[(start + i) % len(choices)] for i in range(n)]
+    # --- Generation (default) library: write to backend file only ---
+    _backend_gen_path = Path("/Users/ibrahimansari/Desktop/final/monorepo-landright/landright-app/backend/experience_library_default.json")
+    summary_gen = f"[Round {round_label}] {repo_full_name} layer {layer} — Clicks: {clicks_str}{time_str}. Judge: {judge_decision}, files updated: {files_updated}."
+    _append_experience_file(_backend_gen_path, summary_gen, force_append=True)
+    takeaways_gen = [
+        "Clear primary CTA with minimal hero clutter and responsive layout correlates with higher conversion in landing tests.",
+        "Focused CTA set (2-4 primary actions) often outperforms pages with many competing calls to action.",
+        "Responsive layouts that preserve hierarchy across breakpoints support conversion across devices.",
+        "Moderate section count with clear structure (hero, value, CTA) supports both scan and conversion.",
+        "Typography that creates clear hierarchy (display for headlines, readable body) guides users toward CTAs.",
+        "Social proof or trust elements near the primary CTA can increase intent without cluttering the main action.",
+        "Use winner pattern from variant data when the gap is clear; avoid over-fitting to a single round.",
+    ]
+    for line in _pick_n(takeaways_gen, 4):
+        _append_experience_file(_backend_gen_path, line, force_append=True)
+    log.info("Appended round %s to backend experience_library_default.json (1 summary + 4 takeaways)", round_label)
+    # --- Data analyst library: 1 summary + 3-4 data-analyst takeaways (used by judge for RUN_ADJUST vs SKIP) ---
+    summary_analyst = f"[Round {round_label}] {repo_full_name} layer {layer} — {judge_decision}, files_updated={files_updated}. Clicks: {clicks_str}{time_str}."
+    _append_experience_file(EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED, summary_analyst)
+    takeaways_analyst = [
+        "Prefer RUN_ADJUST when the best variant has a clear click gap (e.g. 10+ more clicks) over the second-best; SKIP when the gap is marginal.",
+        "Use time-on-page as a tiebreaker when clicks are close; higher engagement on the best variant supports running alignment.",
+        "When CTA structure is unknown (e.g. no GitHub access), judge may still RUN_ADJUST if local variant files are available for alignment.",
+        "Avoid running adjust on every round; wait for a meaningful signal so alignment does not over-fit to noise.",
+        "Reinforcement: When we ran CTA alignment and total conversions increased in a later round, prefer RUN_ADJUST for similar clear gaps.",
+        "Interpret cta_by_variant and time_by_variant together; a variant with slightly fewer clicks but much higher time may be worth aligning to.",
+        "Log each round outcome (SKIP or RUN_ADJUST, files_updated) so the experience library grows and the judge improves over time.",
+    ]
+    for line in _pick_n(takeaways_analyst, 4):
+        _append_experience_file(EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED, line)
 
 
 def _run_learning_step() -> None:
@@ -1693,18 +1813,16 @@ def _run_learning_step() -> None:
 
             if total_before > 0 and (best_after_id != best_before or total_after < total_before):
                 lesson = "Aligning underperforming variants to the previous best's CTA structure led to degradation (best changed or total clicks dropped). Avoid over-fitting to a single winner."
-                best_after_sections = _top_section_summary(section_after_map.get(best_after_id or "", {}))
-                if best_after_sections:
-                    lesson += f" Use section-level engagement, not just totals: after adjustment the highest-attention sections were {best_after_sections}."
                 _append_experience_file(EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED, lesson)
                 _insert_experience_entry_supabase("data_analyst", lesson)
             elif total_after > total_before and best_after_clicks >= best_before_clicks:
-                lesson = "CTA structure alignment to the best-performing variant increased total clicks. Prefer matching CTA placement/count/prominence of the winner when data shows a clear gap."
-                winner_sections = _top_section_summary(section_after_map.get(best_before, {}))
-                if winner_sections:
-                    lesson += f" Use section-level time aggregates for adjustments: the winner's highest-engagement sections were {winner_sections}."
+                lesson = "CTA structure alignment to the best-performing variant increased total clicks. Prefer matching CTA placement, count, and prominence of the winner when data shows a clear gap."
                 _append_experience_file(EXPERIENCE_LIBRARY_CTA_PATH_RESOLVED, lesson)
                 _insert_experience_entry_supabase("cta", lesson)
+                # Reinforcement for data analyst: when adjust helped, reinforce RUN_ADJUST for clear gaps
+                reinforcement = "Reinforcement: When the best variant had a clear gap (e.g. 20%+ more clicks or meaningfully more time-on-page) and we ran CTA alignment, total conversions often increased. Prefer RUN_ADJUST when the gap is clear and data is fresh."
+                _append_experience_file(EXPERIENCE_LIBRARY_DATA_ANALYST_PATH_RESOLVED, reinforcement)
+                _insert_experience_entry_supabase("data_analyst", reinforcement)
 
             if row_id:
                 client.table("adjustment_log").update({"evaluated": True}).eq("id", row_id).execute()
@@ -1730,6 +1848,30 @@ def _run_learning_step() -> None:
         if vid not in by_repo_layer[key]:
             by_repo_layer[key][vid] = sr
 
+    def _winner_snapshot_to_principle(repo: str, layer: str, best_id: str, best_snap: dict) -> str | None:
+        """Map winner snapshot to a single-sentence principle (no raw sections/CTAs/code)."""
+        sections = best_snap.get("sections") or []
+        ctas = best_snap.get("ctas") or []
+        responsive = bool(best_snap.get("responsive"))
+        animated = bool(best_snap.get("animated"))
+        n_sections = len(sections) if isinstance(sections, list) else 0
+        n_ctas = len(ctas) if isinstance(ctas, list) else 0
+        if n_ctas <= 0 and n_sections <= 0 and not responsive and not animated:
+            return None
+        if n_ctas >= 2 and n_ctas <= 4 and responsive:
+            return "Clear primary CTA with minimal hero clutter and responsive layout correlates with higher conversion in landing tests."
+        if n_ctas >= 2 and n_ctas <= 4:
+            return "Focused CTA set (2-4 primary actions) often outperforms pages with many competing calls to action."
+        if responsive and animated:
+            return "Responsive design with subtle animation can improve engagement when content remains scannable."
+        if responsive:
+            return "Responsive layouts that preserve hierarchy across breakpoints support conversion across devices."
+        if n_sections >= 2 and n_sections <= 5:
+            return "Moderate section count with clear structure (hero, value, CTA) supports both scan and conversion."
+        if animated:
+            return "Subtle motion that draws attention to the primary CTA without distraction can improve results."
+        return "Broad appeal within distinctiveness: stand out while remaining accessible to target segments."
+
     for (repo, layer), variants in by_repo_layer.items():
         if len(variants) < 2:
             continue
@@ -1748,24 +1890,17 @@ def _run_learning_step() -> None:
         best_snap = variants.get(best_id)
         if not best_snap:
             continue
-        diff_parts = []
-        if best_snap.get("sections"):
-            diff_parts.append(f"sections {best_snap['sections']}")
-        if best_snap.get("ctas"):
-            diff_parts.append(f"CTAs {(best_snap['ctas'] or [])[:5]}")
-        if best_snap.get("responsive"):
-            diff_parts.append("responsive")
-        if best_snap.get("animated"):
-            diff_parts.append("animated")
-        if diff_parts:
-            dedup_key = (repo, layer, best_id)
-            if dedup_key in _GENERATION_LESSONS_WRITTEN:
-                continue
-            lesson = f"When {best_id} outperformed (repo {repo}), it had: " + "; ".join(str(p) for p in diff_parts) + ". Prefer these patterns in future generations."
-            _append_experience_file(EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED, lesson)
-            _insert_experience_entry_supabase("generation", lesson)
-            _GENERATION_LESSONS_WRITTEN.add(dedup_key)
-            log.info("Learning: inserted generation lesson for %s %s", repo, layer)
+        # Principle-style lesson only: no raw sections/CTAs/code dumps (plan: experience-library-content).
+        lesson = _winner_snapshot_to_principle(repo, layer, best_id, best_snap)
+        if not lesson:
+            continue
+        dedup_key = (repo, layer, best_id)
+        if dedup_key in _GENERATION_LESSONS_WRITTEN:
+            continue
+        _append_experience_file(EXPERIENCE_LIBRARY_GENERATION_PATH_RESOLVED, lesson)
+        _insert_experience_entry_supabase("generation", lesson)
+        _GENERATION_LESSONS_WRITTEN.add(dedup_key)
+        log.info("Learning: inserted generation lesson for %s %s", repo, layer)
 
 
 def _normalize_variant_clicks(variant_clicks: dict[str, int]) -> dict[str, int]:
@@ -1895,8 +2030,8 @@ def _should_run_adjust_llm_judge(
         return run, f"judge_error: {e}"
 
 
-def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[str, int], force_run: bool = False, time_by_variant: dict[str, float] | None = None) -> int:
-    """Run CTA alignment: fetch best variant, align others, push to GitHub. Returns number of variant files pushed (0 if judge said SKIP or error)."""
+def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[str, int], force_run: bool = False, time_by_variant: dict[str, float] | None = None, local_export_dir: Path | None = None) -> int:
+    """Run CTA alignment: fetch best variant, align others; write to local_export_dir or push to GitHub. Returns number of variant files updated (0 if judge said SKIP or error)."""
     normalized = _normalize_variant_clicks(variant_clicks)
     times = time_by_variant or {}
     # Sort by clicks descending, then by total_seconds descending (tiebreaker).
@@ -1916,9 +2051,12 @@ def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[st
             return 0
         log.info("run_adjust_pipeline: %s layer %s judge said RUN_ADJUST, fetching files", repo_full_name, layer)
     try:
-        files = _fetch_variant_files(repo_full_name)
+        if local_export_dir:
+            files = _get_variant_files_from_dir(local_export_dir)
+        else:
+            files = _fetch_variant_files(repo_full_name)
     except Exception as e:
-        log.warning("Adjust pipeline: GitHub fetch failed for %s: %s", repo_full_name, e)
+        log.warning("Adjust pipeline: fetch failed for %s: %s", repo_full_name, e)
         return 0
     log.info("run_adjust_pipeline: %s fetched %s variant files: %s", repo_full_name, len(files), list(files.keys()))
     if best_id not in files:
@@ -1972,11 +2110,14 @@ def run_adjust_pipeline(repo_full_name: str, layer: str, variant_clicks: dict[st
                 underperforming_section_times=section_time_by_variant.get(vid, {}),
             )
             if new_tsx:
-                log.info("Pushing %s for %s (branch: default)", vid, repo_full_name)
-                _push_variant_file(repo_full_name, vid, new_tsx, commit_msg)
+                log.info("Updating %s for %s", vid, repo_full_name)
+                if local_export_dir:
+                    _write_variant_to_local(local_export_dir, vid, new_tsx)
+                else:
+                    _push_variant_file(repo_full_name, vid, new_tsx, commit_msg)
                 _record_snapshot_supabase(repo_full_name, layer, vid, new_tsx, "agent_adjust")
                 pushed += 1
-                log.info("Pushed updated %s for %s layer %s", vid, repo_full_name, layer)
+                log.info("Updated %s for %s layer %s", vid, repo_full_name, layer)
             else:
                 _record_snapshot_supabase(repo_full_name, layer, vid, files[vid], "agent_adjust")
         except Exception as e:
