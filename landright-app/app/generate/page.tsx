@@ -76,11 +76,9 @@ export default function GeneratePage() {
       similarityRound?: number;
     }) => {
       if (!spec) {
-        console.log("[Landright Generate] fetchVariants skipped: no spec");
         return;
       }
       if (!PYTHON_BACKEND_URL) {
-        console.warn("[Landright Generate] missing backend URL");
         setError(MISSING_BACKEND_MSG);
         setState("show");
         setVariants([]);
@@ -92,7 +90,6 @@ export default function GeneratePage() {
       const ac = new AbortController();
       abortControllerRef.current = ac;
       const isRefinement = !!opts?.chosenVariantTsx && opts.selectedVariantIndex != null;
-      console.log("[Landright Generate] fetchVariants", { isRefinement, selectedVariantIndex: opts?.selectedVariantIndex });
       try {
         const url = `${PYTHON_BACKEND_URL}/generate`;
         // Use competitorDna from state, or from sessionStorage on first load (state may not have updated yet)
@@ -118,14 +115,12 @@ export default function GeneratePage() {
               }
             : {}),
         };
-        console.log("[Landright Generate] POST", url);
         const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
           signal: ac.signal,
         });
-        console.log("[Landright Generate] response", res.status, res.statusText);
         let data: { error?: string; message?: string; details?: string; detail?: string | { error?: string; details?: string }; variants?: unknown; experienceLibrary?: string[]; retry_after?: number };
         try {
           const text = await res.text();
@@ -162,7 +157,6 @@ export default function GeneratePage() {
         if (!isRefinement) {
           setSimilarityRound(0);
         }
-        console.log("[Landright Generate] got variants", list.length, "experienceLibrary", (data.experienceLibrary as string[])?.length ?? 0);
         setVariants(list);
         if (Array.isArray((data as Record<string, unknown>).reasoning)) {
           setVariantReasoning((data as Record<string, unknown>).reasoning as string[]);
@@ -195,7 +189,6 @@ export default function GeneratePage() {
         if (message === "Failed to fetch" || /NetworkError|load failed/i.test(message)) {
           message = `${message}. Make sure the backend is running with the venv (e.g. \`cd backend && .venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000\`) and NEXT_PUBLIC_GENERATE_API_URL is set (e.g. http://localhost:8000).`;
         }
-        console.error("[Landright Generate] fetch error", e);
         setError(message);
         setState("show");
         if (!isRefinement) {
@@ -216,7 +209,6 @@ export default function GeneratePage() {
 
   useEffect(() => {
     const storedSpec = typeof window !== "undefined" ? sessionStorage.getItem(STORAGE_KEYS.SPEC) : null;
-    console.log("[Landright Generate] load spec from storage", storedSpec ? "ok" : "missing");
     if (!storedSpec) {
       router.replace("/");
       return;
@@ -224,12 +216,10 @@ export default function GeneratePage() {
     try {
       const parsed = JSON.parse(storedSpec) as DesignSpec;
       setSpec(parsed);
-      console.log("[Landright Generate] spec loaded", parsed?.websiteInformation?.name);
       const storedDna = sessionStorage.getItem("landright-competitor-dna");
       if (storedDna) {
         try {
           setCompetitorDna(JSON.parse(storedDna) as Record<string, unknown>);
-          console.log("[Landright Generate] competitor DNA loaded");
         } catch { /* ignore */ }
       }
       const storedUseCritic = sessionStorage.getItem("landright-use-critic");
@@ -238,8 +228,7 @@ export default function GeneratePage() {
           setUseCritic(JSON.parse(storedUseCritic) as boolean);
         } catch { /* ignore */ }
       }
-    } catch (e) {
-      console.error("[Landright Generate] invalid spec in storage", e);
+    } catch {
       router.replace("/");
     }
   }, [router]);
@@ -255,7 +244,6 @@ export default function GeneratePage() {
         const data = (await res.json()) as { experienceLibrary?: string[] };
         if (!cancelled && Array.isArray(data.experienceLibrary) && data.experienceLibrary.length > 0) {
           setExperienceLibrary(data.experienceLibrary);
-          console.log("[Landright Generate] loaded default experience library", data.experienceLibrary.length, "items");
         }
       } catch {
         // ignore
@@ -319,13 +307,11 @@ export default function GeneratePage() {
   }
 
   function handlePick(index: number) {
-    console.log("[Landright Generate] handlePick", index);
     setSelectedIndex(index);
     setState("picked");
   }
 
   function handleSatisfied() {
-    console.log("[Landright Generate] handleSatisfied", { selectedIndex });
     if (selectedIndex != null && variants[selectedIndex]) {
       setChosenFinalHtml(variants[selectedIndex]);
     }
@@ -429,7 +415,6 @@ export default function GeneratePage() {
 
   async function handleGenerateSimilar() {
     if (selectedIndex == null || selectedIndex < 0 || selectedIndex >= variants.length || !variants[selectedIndex]) return;
-    console.log("[Landright Generate] handleGenerateSimilar", { selectedIndex, experienceLibraryLength: experienceLibrary.length });
     setRegenerating(true);
     setState("loading");
     try {
@@ -696,8 +681,8 @@ export default function GeneratePage() {
                     sessionStorage.setItem("github_oauth_state", state);
                     const url = `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=public_repo&state=${encodeURIComponent(state)}`;
                     window.location.href = url;
-                  } catch (e) {
-                    console.error("[Landright] Export to GitHub redirect failed", e);
+                  } catch {
+                    // ignore redirect errors
                   }
                 }}
                 className="mt-3 w-full rounded-lg border border-orange-500/50 px-4 py-2 text-sm font-medium text-white hover:bg-orange-500/20"

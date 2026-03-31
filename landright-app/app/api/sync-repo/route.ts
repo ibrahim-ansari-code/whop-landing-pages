@@ -1,20 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validateTsx } from "@/lib/preview-compile";
-
-const DEFAULT_LAYER_NAME = "layer-1";
-const DEFAULT_COMMIT_MESSAGE = "Update landing page from Landright";
-
-function buildSyncHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  const apiKey = process.env.SYNC_AGENT_API_KEY?.trim();
-  if (apiKey) {
-    headers["x-api-key"] = apiKey;
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
+import { buildSyncHeaders, DEFAULT_LAYER_NAME, DEFAULT_COMMIT_MESSAGE_SINGLE as DEFAULT_COMMIT_MESSAGE } from "@/lib/sync-utils";
 
 /**
  * Push full Vercel bundle (app/page.tsx wrapper + layout + 4 variants + config) to GitHub.

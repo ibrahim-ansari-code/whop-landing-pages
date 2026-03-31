@@ -57,7 +57,6 @@ export default function Home() {
     e.preventDefault();
     setValidationError(null);
     const name = companyName.trim();
-    console.log("[Landright Home] handleContinue", { companyName: name, length: name.length });
     if (name.length < 1) {
       setValidationError("Company name is required");
       return;
@@ -67,7 +66,6 @@ export default function Home() {
       return;
     }
     setStep(2);
-    console.log("[Landright Home] step -> 2");
   }
 
   function handleSubmit(e: React.FormEvent) {
@@ -93,12 +91,10 @@ export default function Home() {
     };
     const err = validateQuestionsForm(data);
     if (err) {
-      console.log("[Landright Home] validation failed", err);
       setValidationError(err.message);
       return;
     }
     const spec = buildSpecFromForm(data);
-    console.log("[Landright Home] spec built", { companyName: spec.websiteInformation?.name });
     if (typeof window !== "undefined") {
       sessionStorage.setItem(STORAGE_KEYS.SPEC, JSON.stringify(spec));
       sessionStorage.setItem("landright-use-critic", JSON.stringify(useCritic));
@@ -108,7 +104,6 @@ export default function Home() {
         sessionStorage.removeItem("landright-competitor-dna");
       }
     }
-    console.log("[Landright Home] navigating to /generate");
     router.push("/generate");
   }
 

@@ -10,9 +10,9 @@ import Variant4 from "./variants/variant-4";
 const VARIANTS = [Variant1, Variant2, Variant3, Variant4];
 const REPO_FULL_NAME = 'simgym/local';
 const LAYER = '1';
-const BEACON_URL = 'https://gasiform-silva-sprawly.ngrok-free.dev';
-const POSTHOG_KEY = 'phc_kEMwL4YHKOlAYC4Eoic8d5uCfRYZjRF6ZCknqynmoUJ';
-const POSTHOG_HOST = 'https://us.i.posthog.com';
+const BEACON_URL = (process.env.NEXT_PUBLIC_BEACON_URL ?? '').replace(/\/$/, '');
+const POSTHOG_KEY = process.env.NEXT_PUBLIC_POSTHOG_KEY ?? '';
+const POSTHOG_HOST = process.env.NEXT_PUBLIC_POSTHOG_HOST ?? 'https://us.i.posthog.com';
 const POOL_KEY = "landright_variant_pool";
 
 function getPool(): number[] {
@@ -52,7 +52,6 @@ function getForcedVariantFromUrl(): number | null {
 }
 
 function sendCtaClick(ctaLabel?: string, ctaId?: string) {
-  const w = window as unknown as { __landrightVariantId?: number };
   fetch(BEACON_URL + "/beacon", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -60,7 +59,7 @@ function sendCtaClick(ctaLabel?: string, ctaId?: string) {
       event: "button_click",
       repo_full_name: REPO_FULL_NAME,
       layer: LAYER,
-      variant_id: String(w.__landrightVariantId ?? ""),
+      variant_id: String(window.__landrightVariantId ?? ""),
       cta_label: ctaLabel ?? undefined,
       cta_id: ctaId ?? undefined,
     }),
@@ -68,11 +67,10 @@ function sendCtaClick(ctaLabel?: string, ctaId?: string) {
 }
 
 function sendTimeOnPage(durationSeconds: number, sectionId?: string) {
-  const w = window as unknown as { __landrightVariantId?: number };
   const payload: Record<string, unknown> = {
     repo_full_name: REPO_FULL_NAME,
     layer: LAYER,
-    variant_id: String(w.__landrightVariantId ?? ""),
+    variant_id: String(window.__landrightVariantId ?? ""),
     duration_seconds: durationSeconds,
   };
   if (sectionId) payload.section_id = sectionId;
@@ -98,7 +96,7 @@ export default function ClientPage() {
     setV(forced !== null ? forced : pickAndUpdatePool());
   }, []);
   useEffect(() => {
-    if (v != null) (window as unknown as { __landrightVariantId?: number }).__landrightVariantId = v;
+    if (v != null) window.__landrightVariantId = v;
   }, [v]);
   useEffect(() => {
     if (v == null) return;

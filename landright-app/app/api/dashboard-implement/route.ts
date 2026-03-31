@@ -1,16 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-
-function buildSyncHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  const apiKey = process.env.SYNC_AGENT_API_KEY?.trim();
-  if (apiKey) {
-    headers["x-api-key"] = apiKey;
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
+import { buildSyncHeaders } from "@/lib/sync-utils";
 
 /**
  * Forward dashboard "implement" requests to the sync agent.

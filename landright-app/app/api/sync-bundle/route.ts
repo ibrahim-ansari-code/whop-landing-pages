@@ -1,20 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { buildVercelBundleWithRetry } from "@/lib/vercel-build-with-retry";
-
-const DEFAULT_LAYER_NAME = "layer-1";
-const DEFAULT_COMMIT_MESSAGE = "Deploy 4 variants from Landright";
-
-function buildSyncHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  const apiKey = process.env.SYNC_AGENT_API_KEY?.trim();
-  if (apiKey) {
-    headers["x-api-key"] = apiKey;
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
+import { buildSyncHeaders, DEFAULT_LAYER_NAME, DEFAULT_COMMIT_MESSAGE_BUNDLE as DEFAULT_COMMIT_MESSAGE } from "@/lib/sync-utils";
 
 /**
  * Build a provided bundle and push to GitHub. Used when automatic fixes were exhausted:
@@ -71,11 +57,6 @@ export async function POST(request: NextRequest) {
     typeof body?.commitMessage === "string" && body.commitMessage.trim() !== ""
       ? body.commitMessage.trim()
       : DEFAULT_COMMIT_MESSAGE;
-  const _layerName =
-    typeof body?.layerName === "string" && body.layerName.trim() !== ""
-      ? body.layerName.trim()
-      : DEFAULT_LAYER_NAME;
-  void _layerName;
 
   let finalFiles: Record<string, string>;
   if (skipBuildCheck) {

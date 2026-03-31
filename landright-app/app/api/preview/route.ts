@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { looksLikeTsx, compileTsxToHtml } from "@/lib/preview-compile";
-
-const MAX_TSX_LENGTH = 1_500_000;
+import { MAX_TSX_LENGTH } from "@/lib/config";
 
 export async function POST(request: NextRequest) {
   let body: { tsx?: string };

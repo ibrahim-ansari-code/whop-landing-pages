@@ -9,7 +9,7 @@ import fs from "fs";
 import path from "path";
 import { compileTsxToHtml } from "@/lib/preview-compile";
 
-const BACKEND = "http://localhost:8000";
+const BACKEND = process.env.NEXT_PUBLIC_GENERATE_API_URL?.trim().replace(/\/$/, "") ?? "http://localhost:8000";
 
 const SPEC_WITH_CALENDLY = {
   spec: {

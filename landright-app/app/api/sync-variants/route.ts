@@ -1,21 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validateTsx } from "@/lib/preview-compile";
+import { buildSyncHeaders, DEFAULT_LAYER_NAME, DEFAULT_COMMIT_MESSAGE_BUNDLE as DEFAULT_COMMIT_MESSAGE } from "@/lib/sync-utils";
 
-const DEFAULT_LAYER_NAME = "layer-1";
-const DEFAULT_COMMIT_MESSAGE = "Deploy 4 variants from Landright";
 const VARIANT_COUNT = 4;
-
-function buildSyncHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  const apiKey = process.env.SYNC_AGENT_API_KEY?.trim();
-  if (apiKey) {
-    headers["x-api-key"] = apiKey;
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
 
 /**
  * Push full Vercel bundle (app/page.tsx wrapper + layout + 4 variants + config) to GitHub

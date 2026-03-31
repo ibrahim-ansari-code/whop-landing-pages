@@ -44,6 +44,9 @@ export const GITHUB_APP_INSTALL_URL =
     ? process.env.NEXT_PUBLIC_GITHUB_APP_INSTALL_URL.trim()
     : "";
 
+/** Max TSX payload size accepted by /api/preview and /api/validate-tsx. */
+export const MAX_TSX_LENGTH = 1_500_000;
+
 /** Validation limits (shared with API where possible). */
 export const LIMITS = {
   BUSINESS_INFO_MIN_LENGTH: 10,
