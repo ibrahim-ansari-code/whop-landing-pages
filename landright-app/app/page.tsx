@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
@@ -8,6 +8,9 @@ import { buildSpecFromForm, validateQuestionsForm, type CtaType, type CtaEntry }
 import { STORAGE_KEYS } from "@/lib/config";
 import { InspirationPanel } from "@/components/InspirationPanel";
 import { COPY } from "@/lib/copy";
+
+/** Min time between successful "Generate landing pages" navigations (ms). */
+const GENERATE_SUBMIT_COOLDOWN_MS = 8000;
 
 const CTA_VALUES: CtaType[] = ["button", "call", "trial", "contact_form", "contact_mailto"];
 
@@ -29,8 +32,14 @@ export default function Home() {
   const [logoDataUrl, setLogoDataUrl] = useState<string | null>(null);
   const [logoFileName, setLogoFileName] = useState<string | null>(null);
   const [inspirationData, setInspirationData] = useState<Record<string, unknown> | null>(null);
-  const [useCritic, setUseCritic] = useState(false);
+  const [inspirationGate, setInspirationGate] = useState({ submitBlocked: false, scanning: false });
   const [validationError, setValidationError] = useState<string | null>(null);
+  const lastGenerateNavAt = useRef(0);
+  const generateSubmitLock = useRef(false);
+
+  const onInspirationGateChange = useCallback((gate: { submitBlocked: boolean; scanning: boolean }) => {
+    setInspirationGate(gate);
+  }, []);
 
   function handleLogoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -71,6 +80,17 @@ export default function Home() {
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setValidationError(null);
+    if (generateSubmitLock.current) return;
+    if (inspirationGate.submitBlocked) {
+      setValidationError(COPY.HOME.WAIT_INSPIRATION);
+      return;
+    }
+    const now = Date.now();
+    if (now - lastGenerateNavAt.current < GENERATE_SUBMIT_COOLDOWN_MS) {
+      const waitSec = Math.ceil((GENERATE_SUBMIT_COOLDOWN_MS - (now - lastGenerateNavAt.current)) / 1000);
+      setValidationError(COPY.HOME.SUBMIT_COOLDOWN(waitSec));
+      return;
+    }
     const data = {
       companyName: companyName.trim(),
       businessInfo: businessInfo.trim(),
@@ -97,13 +117,15 @@ export default function Home() {
     const spec = buildSpecFromForm(data);
     if (typeof window !== "undefined") {
       sessionStorage.setItem(STORAGE_KEYS.SPEC, JSON.stringify(spec));
-      sessionStorage.setItem("landright-use-critic", JSON.stringify(useCritic));
+      sessionStorage.removeItem("landright-use-critic");
       if (inspirationData) {
         sessionStorage.setItem("landright-competitor-dna", JSON.stringify(inspirationData));
       } else {
         sessionStorage.removeItem("landright-competitor-dna");
       }
     }
+    generateSubmitLock.current = true;
+    lastGenerateNavAt.current = Date.now();
     router.push("/generate");
   }
 
@@ -343,7 +365,10 @@ export default function Home() {
                 </button>
               </div>
             </div>
-            <InspirationPanel onInspirationChange={setInspirationData} />
+            <InspirationPanel
+              onInspirationChange={setInspirationData}
+              onInspirationGateChange={onInspirationGateChange}
+            />
             <div className="mt-8">
               <h3 className="text-sm font-medium text-zinc-300">{COPY.HOME.SOCIALS}</h3>
               <div className="mt-2 space-y-2">
@@ -402,15 +427,6 @@ export default function Home() {
                 </div>
               </div>
             </div>
-            <label className="flex items-center gap-2 mt-4 p-3 rounded-lg border border-zinc-700 bg-zinc-800/50 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={useCritic}
-                onChange={(e) => setUseCritic(e.target.checked)}
-                className="h-4 w-4 rounded border-zinc-600 bg-zinc-800 text-orange-500 focus:ring-orange-500"
-              />
-              <span className="text-sm text-zinc-300">{COPY.HOME.USE_CRITIC_CHECKBOX}</span>
-            </label>
             <div className="flex gap-3 mt-4">
               <button
                 type="button"
@@ -421,9 +437,10 @@ export default function Home() {
               </button>
               <button
                 type="submit"
-                className="flex-1 rounded-lg bg-zinc-100 py-3 text-sm font-medium text-zinc-900 transition hover:bg-white"
+                disabled={inspirationGate.submitBlocked}
+                className="flex-1 rounded-lg bg-zinc-100 py-3 text-sm font-medium text-zinc-900 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {COPY.HOME.SUBMIT}
+                {inspirationGate.scanning ? COPY.HOME.INSPIRATION_SCANNING : COPY.HOME.SUBMIT}
               </button>
             </div>
           </form>

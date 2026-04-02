@@ -248,7 +248,6 @@ class GenerateBody(BaseModel):
     competitorDna: dict | None = None  # ExtractedDesignSpec from /extract-design-spec (JSON)
     competitorDnaMd: str | None = None  # design inspiration in markdown; used for synthesis alongside or instead of competitorDna
     inspirationVariantModes: list[str] | None = None  # optional [1..4] modes for initial gen when inspiration present; else default
-    useCritic: bool = True  # if False, skip critic audit (faster; no per-variant reasoning/conversionDrivers)
 
 
 class BeaconBody(BaseModel):
@@ -1607,156 +1606,6 @@ app.add_middleware(
 app.add_middleware(BeaconCORSMiddleware)  # outermost: allow any origin for /beacon only
 
 
-# --- Critic Agent (Shadow-Mode Internal Audit) --------------------------------
-CRITIC_THRESHOLD = float(os.environ.get("CRITIC_THRESHOLD", "0.85"))
-CRITIC_MAX_RETRIES = int(os.environ.get("CRITIC_MAX_RETRIES", "3"))
-
-def _build_critic_system_prompt(inspiration_triggers: list[str] | None = None) -> str:
-    """Build critic system prompt, optionally incorporating persuasion triggers as hard constraints."""
-    trigger_block = ""
-    if inspiration_triggers:
-        trigger_list = ", ".join(inspiration_triggers[:8])
-        trigger_block = f"""
-
-HARD CONSTRAINTS from inspiration scan — if the variant is missing any of these elements, it MUST be flagged for re-generation:
-  Required persuasion elements: {trigger_list}
-  Check: Does the variant include a risk-reversal element (e.g. 'no credit card required', 'free trial', guarantee)?
-  Check: Does the variant include social proof (e.g. customer count, logos, testimonials)?
-  Check: Does the variant use authority signals (e.g. trust badges, certifications, 'trusted by X')?
-  If ANY required element from the scan is missing, set that axis score below 0.85 and list the missing element in issues."""
-
-    return f"""You are a landing page conversion expert and design critic. Score the given TSX landing page variant on two axes.
-
-Output ONLY a valid JSON object (no markdown, no commentary):
-{{
-  "friction": 0.0-1.0,
-  "clarity": 0.0-1.0,
-  "reasoning": "One sentence explaining why this variant is better than the original seed. Be specific about conversion improvements (e.g. 'Simplified the footer to reduce exit-path friction').",
-  "issues": ["list of specific issues if friction or clarity is below 0.85"],
-  "conversion_drivers": ["top 3 conversion-driving design patterns used in this variant (e.g. 'Gradient CTA with hover lift', 'Social Proof Marquee', 'Bento Grid Layout')"]
-}}
-
-Scoring guide:
-- friction (INVERTED: 1.0 = zero friction, 0.0 = maximum friction):
-  * 1.0: Crystal clear CTA, minimal distractions, zero unnecessary form fields or steps.
-  * 0.85: Good but minor issues — one unclear label, slightly competing CTAs.
-  * 0.7: Noticeable friction — multiple CTAs compete, unclear value prop, too many nav links.
-  * <0.5: Significant friction — confusing layout, broken flow, unclear next step.
-
-- clarity (1.0 = perfectly clear, 0.0 = completely confusing):
-  * 1.0: Headline instantly communicates value, hierarchy is obvious, visual flow is natural.
-  * 0.85: Good but one element is ambiguous — subhead doesn't support headline, or section order is off.
-  * 0.7: Multiple clarity issues — jargon, unclear headline, competing messages.
-  * <0.5: Fundamentally unclear — user can't tell what the product does in 5 seconds.
-
-- reasoning: Explain what makes this variant beat the seed / generic landing page. Be specific about conversion. One or two sentences max.
-- conversion_drivers: Name exactly 3 specific design patterns that drive conversion in this variant.{trigger_block}
-
-Output ONLY the JSON object."""
-
-
-def _critic_score_variant(
-    api_key: str, tsx: str, spec: DesignSpec, variant_index: int,
-    inspiration_triggers: list[str] | None = None,
-) -> dict:
-    """Score a single variant on friction and clarity. Returns {friction, clarity, reasoning, issues, conversion_drivers}."""
-    excerpt = tsx[:8000]
-    spec_summary = f"Company: {spec.websiteInformation.name}, Does: {spec.websiteInformation.whatTheyDo[:200]}"
-    user_msg = f"Score this landing page variant (variant {variant_index + 1}/4).\n\nBusiness: {spec_summary}\n\nTSX (excerpt):\n{excerpt}"
-    system_prompt = _build_critic_system_prompt(inspiration_triggers)
-    try:
-        raw = call_claude(api_key, system_prompt, user_msg, max_tokens_override=512)
-        text = raw.strip()
-        if "```json" in text:
-            text = text.split("```json")[-1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        result = json.loads(text)
-        return {
-            "friction": float(result.get("friction", 0.5)),
-            "clarity": float(result.get("clarity", 0.5)),
-            "reasoning": str(result.get("reasoning", "")),
-            "issues": result.get("issues", []),
-            "conversion_drivers": result.get("conversion_drivers", []),
-        }
-    except Exception as e:
-        log.warning("critic_score_variant %d failed: %s", variant_index, e)
-        return {"friction": 0.9, "clarity": 0.9, "reasoning": "Scoring unavailable", "issues": [], "conversion_drivers": []}
-
-
-def _extract_inspiration_triggers(competitor_dna: dict | None) -> list[str]:
-    """Pull persuasion triggers from inspiration data to use as critic constraints.
-    Supports both flat schema (persuasion_triggers at top level) and legacy nested (diction.triggers)."""
-    if not competitor_dna:
-        return []
-    # Flat schema (current)
-    flat = competitor_dna.get("persuasion_triggers")
-    if isinstance(flat, list) and flat:
-        return [str(t) for t in flat[:10] if t]
-    # Legacy nested schema
-    diction = competitor_dna.get("diction", {})
-    if isinstance(diction, dict):
-        nested = diction.get("triggers", [])
-        if isinstance(nested, list) and nested:
-            return [str(t) for t in nested[:10] if t]
-    return []
-
-
-def _run_critic_audit(
-    api_key: str,
-    variants: list[str | None],
-    spec: DesignSpec,
-    regenerate_fn,
-    competitor_dna: dict | None = None,
-) -> tuple[list[str | None], list[dict]]:
-    """Run critic audit on all variants. Re-generate any below threshold. Returns (variants, reasoning_list)."""
-    n = len(variants)
-    reasoning_list: list[dict] = [{"reasoning": "", "friction": 0.0, "clarity": 0.0, "conversion_drivers": []}] * n
-    current_variants = list(variants)
-    inspiration_triggers = _extract_inspiration_triggers(competitor_dna)
-    if inspiration_triggers:
-        log.info("critic_audit: using %d inspiration triggers as constraints: %s", len(inspiration_triggers), inspiration_triggers)
-
-    for attempt in range(1 + CRITIC_MAX_RETRIES):
-        scores: list[dict] = [None] * n
-
-        def score_one(i: int) -> tuple[int, dict]:
-            if current_variants[i]:
-                sc = _critic_score_variant(api_key, current_variants[i], spec, i, inspiration_triggers)
-                return (i, sc)
-            return (i, {"friction": 0.0, "clarity": 0.0, "reasoning": "Variant generation failed", "issues": ["empty"]})
-
-        with ThreadPoolExecutor(max_workers=n) as executor:
-            future_to_i = {executor.submit(score_one, i): i for i in range(n)}
-            for future in as_completed(future_to_i):
-                idx, score = future.result()
-                scores[idx] = score
-
-        reasoning_list = scores
-        failing = [
-            i for i in range(n)
-            if current_variants[i]
-            and (scores[i]["friction"] < CRITIC_THRESHOLD or scores[i]["clarity"] < CRITIC_THRESHOLD)
-        ]
-
-        if not failing or attempt >= CRITIC_MAX_RETRIES:
-            break
-
-        log.info("critic_audit attempt %d: %d variants below %.2f, regenerating", attempt + 1, len(failing), CRITIC_THRESHOLD)
-
-        for i in failing:
-            issues_str = "; ".join(scores[i].get("issues", [])[:3])
-            feedback = f"Critic feedback: friction={scores[i]['friction']:.2f}, clarity={scores[i]['clarity']:.2f}. Issues: {issues_str}. Fix these issues."
-            try:
-                new_tsx = regenerate_fn(i + 1, feedback)
-                current_variants[i] = new_tsx
-                log.info("critic_audit: regenerated variant %d", i + 1)
-            except Exception as e:
-                log.warning("critic_audit: failed to regenerate variant %d: %s", i + 1, e)
-
-    return current_variants, reasoning_list
-
-
 # --- DesignSpecPipeline: extractDesignSpec ------------------------------------
 _EXTRACT_SYSTEM_PROMPT = """You are a landing page design analyst. Given a screenshot, extract design DNA as a flat JSON.
 
@@ -2397,29 +2246,8 @@ def generate(body: GenerateBody):
         log.info("generate: similar path done, variants=%s, experience_library_len=%s", len(variants), len(full_library))
         variants = [_inject_logo_url(v, spec) if v else v for v in variants]
 
-        # Critic Agent: audit and auto-fix
-        def _regen_similar(n: int, feedback: str) -> str:
-            system_blocks = _get_similar_variant_system_blocks(
-                experience_brief, experience_decayed, similarity_round, diversity_instruction,
-                competitor_dna=body.competitorDna,
-                competitor_dna_md=body.competitorDnaMd,
-            )
-            base_msg = build_similar_variant_user_message(
-                experience_brief, spec, n, experience_decayed, similarity_round, diversity_instruction,
-            )
-            user_content = base_msg + f"\n\n{feedback}"
-            raw_text = call_claude(api_key, system_blocks, user_content, max_tokens_override=max_tokens)
-            tsx_raw = _parse_single_variant_response(raw_text)
-            if tsx_raw is None:
-                raise RuntimeError(f"Variant {n}: re-generation failed")
-            tsx = _strip_tsx_fences(tsx_raw.strip())
-            return _inject_logo_url(tsx, spec)
-
-        if body.useCritic:
-            variants, reasoning_list = _run_critic_audit(api_key, variants, spec, _regen_similar, competitor_dna=body.competitorDna)
-        else:
-            n = len(variants)
-            reasoning_list = [{"reasoning": "", "conversion_drivers": []} for _ in range(n)]
+        n = len(variants)
+        reasoning_list = [{"reasoning": "", "conversion_drivers": []} for _ in range(n)]
         reasoning_strings = [r.get("reasoning", "") for r in reasoning_list]
         conversion_drivers = [r.get("conversion_drivers", []) for r in reasoning_list]
         return {"variants": variants, "source": "anthropic", "experienceLibrary": full_library, "reasoning": reasoning_strings, "conversionDrivers": conversion_drivers}
@@ -2528,32 +2356,8 @@ def generate(body: GenerateBody):
     log.info("generate: refinement path done, variants=%s", len(variants))
     variants = [_inject_logo_url(v, spec) if v else v for v in variants]
 
-    # Critic Agent: audit and auto-fix
-    def _regen_refinement(n: int, feedback: str) -> str:
-        mode_instruction = _inspiration_mode_instruction(inspiration_modes[n - 1]) if n <= len(inspiration_modes) else ""
-        system_blocks = _get_single_variant_system_blocks(
-            prompt_id, n, diversity_instruction_refinement, target_component,
-            competitor_dna=body.competitorDna, competitor_dna_md=body.competitorDnaMd,
-            use_inspiration_structure_line=use_inspiration_structure_line,
-        )
-        base_msg = build_single_variant_user_message(
-            refined_brief, n, chosen_html, change_request, selected_variant_index, experience_decayed,
-            diversity_instruction_refinement, spec, target_component,
-            inspiration_mode_instruction=mode_instruction,
-        )
-        user_content = base_msg + f"\n\n{feedback}"
-        raw_text = call_claude(api_key, system_blocks, user_content, max_tokens_override=max_tokens)
-        tsx_raw = _parse_single_variant_response(raw_text)
-        if tsx_raw is None:
-            raise RuntimeError(f"Variant {n}: re-generation failed")
-        tsx = _strip_tsx_fences(tsx_raw.strip())
-        return _inject_logo_url(tsx, spec)
-
-    if body.useCritic:
-        variants, reasoning_list = _run_critic_audit(api_key, variants, spec, _regen_refinement, competitor_dna=body.competitorDna)
-    else:
-        n = len(variants)
-        reasoning_list = [{"reasoning": "", "conversion_drivers": []} for _ in range(n)]
+    n = len(variants)
+    reasoning_list = [{"reasoning": "", "conversion_drivers": []} for _ in range(n)]
     reasoning_strings = [r.get("reasoning", "") for r in reasoning_list]
     conversion_drivers = [r.get("conversion_drivers", []) for r in reasoning_list]
     return {"variants": variants, "source": "anthropic", "experienceLibrary": experience_lib, "reasoning": reasoning_strings, "conversionDrivers": conversion_drivers}

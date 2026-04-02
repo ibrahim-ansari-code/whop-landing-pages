@@ -26,8 +26,6 @@ export default function GeneratePage() {
   const router = useRouter();
   const [spec, setSpec] = useState<DesignSpec | null>(null);
   const [variants, setVariants] = useState<string[]>([]);
-  const [variantReasoning, setVariantReasoning] = useState<string[]>([]);
-  const [conversionDrivers, setConversionDrivers] = useState<string[][]>([]);
   const [state, setState] = useState<VariantState>("loading");
   const [viewingIndex, setViewingIndex] = useState(0);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
@@ -63,7 +61,6 @@ export default function GeneratePage() {
   const [exportToGitHubRepoName, setExportToGitHubRepoName] = useState("");
   const [exportToGitHubLayer, setExportToGitHubLayer] = useState("1");
   const [competitorDna, setCompetitorDna] = useState<Record<string, unknown> | null>(null);
-  const [useCritic, setUseCritic] = useState(false);
   const initialFetchDone = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -103,7 +100,6 @@ export default function GeneratePage() {
         const body: Record<string, unknown> = {
           spec,
           promptId: DEFAULT_PROMPT_ID,
-          useCritic,
           ...(dna ? { competitorDna: dna } : {}),
           ...(isRefinement
             ? {
@@ -158,16 +154,6 @@ export default function GeneratePage() {
           setSimilarityRound(0);
         }
         setVariants(list);
-        if (Array.isArray((data as Record<string, unknown>).reasoning)) {
-          setVariantReasoning((data as Record<string, unknown>).reasoning as string[]);
-        } else {
-          setVariantReasoning([]);
-        }
-        if (Array.isArray((data as Record<string, unknown>).conversionDrivers)) {
-          setConversionDrivers((data as Record<string, unknown>).conversionDrivers as string[][]);
-        } else {
-          setConversionDrivers([]);
-        }
         if (Array.isArray(data.experienceLibrary)) {
           setExperienceLibrary(data.experienceLibrary);
         }
@@ -197,7 +183,7 @@ export default function GeneratePage() {
         }
       }
     },
-    [spec, competitorDna, useCritic]
+    [spec, competitorDna]
   );
 
   useEffect(() => {
@@ -220,12 +206,6 @@ export default function GeneratePage() {
       if (storedDna) {
         try {
           setCompetitorDna(JSON.parse(storedDna) as Record<string, unknown>);
-        } catch { /* ignore */ }
-      }
-      const storedUseCritic = sessionStorage.getItem("landright-use-critic");
-      if (storedUseCritic !== null) {
-        try {
-          setUseCritic(JSON.parse(storedUseCritic) as boolean);
         } catch { /* ignore */ }
       }
     } catch {
@@ -912,26 +892,6 @@ export default function GeneratePage() {
                 <span className="text-white/60 max-w-md truncate" title={validation.errors.join(" ")}>
                   {validation.errors[0]}
                 </span>
-              )}
-            </div>
-          )}
-          {/* Critic reasoning + conversion drivers for current variant */}
-          {(variantReasoning[viewingIndex] || (conversionDrivers[viewingIndex] && conversionDrivers[viewingIndex].length > 0)) && (
-            <div className="flex-none px-4 py-2 border-b border-orange-500/10 bg-gradient-to-r from-orange-950/30 to-black/80 text-xs text-orange-200/80">
-              {variantReasoning[viewingIndex] && (
-                <div className="flex items-start gap-2">
-                  <span className="text-orange-400 mt-0.5 shrink-0">&#9733;</span>
-                  <span>{variantReasoning[viewingIndex]}</span>
-                </div>
-              )}
-              {conversionDrivers[viewingIndex] && conversionDrivers[viewingIndex].length > 0 && (
-                <div className="flex items-center gap-2 mt-1 flex-wrap">
-                  {conversionDrivers[viewingIndex].map((d, i) => (
-                    <span key={i} className="inline-flex items-center gap-1 bg-orange-500/15 border border-orange-500/20 rounded-full px-2 py-0.5 text-[10px] text-orange-300">
-                      {d}
-                    </span>
-                  ))}
-                </div>
               )}
             </div>
           )}

@@ -41,8 +41,12 @@ export const COPY = {
     TERMS_URL: "Terms & conditions URL",
     SECURITY_URL: "Security URL",
     CONTINUE: "Continue",
-    USE_CRITIC_CHECKBOX: "Use quality critique (slower — better variants and per-variant reasoning)",
     SUBMIT: "Generate landing pages",
+    INSPIRATION_SCANNING: "Scanning inspiration…",
+    RETRY_INSPIRATION: "Retry scan",
+    WAIT_INSPIRATION:
+      "Wait until inspiration finishes scanning, remove the screenshot, or retry after fixing the error.",
+    SUBMIT_COOLDOWN: (seconds: number) => `Please wait ${seconds}s before generating again.`,
     COLOR_SCHEME: "Color scheme",
     COLOR_PRESETS: {
       neutral: "Neutral (grays)",
